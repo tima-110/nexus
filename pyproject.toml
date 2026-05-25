@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nexus"
+version = "0.1.0"
+description = "Execution gateway and strategy tracking layer for broker APIs."
+requires-python = ">=3.12"
+dependencies = [
+    "typer[all]>=0.12",
+    "rich>=13",
+    "pydantic>=2",
+    "platformdirs>=4",
+    "python-crontab>=3.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+nexus = "nexus.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nexus"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
