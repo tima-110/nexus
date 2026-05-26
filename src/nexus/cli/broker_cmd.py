@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 import typer
 
+from nexus.broker import AlpacaBroker
 from nexus.db import get_connection, init_db
 
 broker_app = typer.Typer(name="broker", no_args_is_help=True)
@@ -59,3 +60,143 @@ def broker_list() -> None:
             f" {row['cash_balance']:>12.2f}"
             f" {synced}"
         )
+
+
+@broker_app.command("show")
+def broker_show(
+    profile_name: str = typer.Argument(..., help="Broker profile name"),
+) -> None:
+    """Show details for a broker account."""
+    conn = get_connection()
+    init_db(conn)
+
+    row = conn.execute(
+        "SELECT * FROM broker_accounts WHERE profile_name = ?",
+        (profile_name,),
+    ).fetchone()
+
+    if row is None:
+        typer.echo(f"Error: Broker account '{profile_name}' not found.", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"Profile:           {row['profile_name']}")
+    typer.echo(f"Margin multiplier: {row['margin_multiplier']:.2f}")
+    typer.echo(f"Cached cash:       ${row['cash_balance']:.2f}")
+    typer.echo(f"Last synced:       {row['last_synced_at'] or 'never'}")
+
+    try:
+        broker = AlpacaBroker(profile_name)
+        account = broker.get_account()
+        positions = broker.get_positions()
+        typer.echo("")
+        typer.echo("Live account:")
+        typer.echo(f"  Cash:         ${account.cash:.2f}")
+        typer.echo(f"  Buying power: ${account.buying_power:.2f}")
+        typer.echo(f"  Equity:       ${account.equity:.2f}")
+        if positions:
+            typer.echo("")
+            typer.echo("Live positions:")
+            typer.echo(f"  {'SYMBOL':<10} {'QTY':>8} {'AVG_ENTRY':>12} {'CUR_PRICE':>12} {'UNREAL_PL':>12}")
+            typer.echo("  " + "-" * 56)
+            for pos in positions:
+                typer.echo(
+                    f"  {pos.symbol:<10} {pos.qty:>8}"
+                    f" {pos.avg_entry_price:>12.2f}"
+                    f" {pos.current_price:>12.2f}"
+                    f" {pos.unrealized_pl:>12.2f}"
+                )
+        else:
+            typer.echo("  (no open positions)")
+    except RuntimeError as exc:
+        typer.echo(f"(Live data unavailable: {exc})")
+
+    strategies = conn.execute(
+        "SELECT name, cash_balance FROM strategies WHERE broker_account_id = ?",
+        (row["id"],),
+    ).fetchall()
+
+    typer.echo("")
+    if strategies:
+        typer.echo("Attached strategies:")
+        typer.echo(f"  {'NAME':<20} {'CASH_BAL':>12}")
+        typer.echo("  " + "-" * 33)
+        for s in strategies:
+            typer.echo(f"  {s['name']:<20} {s['cash_balance']:>12.2f}")
+    else:
+        typer.echo("Attached strategies: (none)")
+
+
+@broker_app.command("sync")
+def broker_sync(
+    profile_name: str | None = typer.Argument(None, help="Broker profile (omit for all)"),
+) -> None:
+    """Sync cash balance from the broker (one or all)."""
+    conn = get_connection()
+    init_db(conn)
+
+    if profile_name is not None:
+        row = conn.execute(
+            "SELECT id, profile_name FROM broker_accounts WHERE profile_name = ?",
+            (profile_name,),
+        ).fetchone()
+        if row is None:
+            typer.echo(f"Error: Broker account '{profile_name}' not found.", err=True)
+            raise typer.Exit(1)
+        brokers = [row]
+    else:
+        brokers = conn.execute(
+            "SELECT id, profile_name FROM broker_accounts ORDER BY id"
+        ).fetchall()
+
+    if not brokers:
+        typer.echo("No broker accounts registered.")
+        return
+
+    for broker_row in brokers:
+        profile = broker_row["profile_name"]
+        try:
+            account = AlpacaBroker(profile).get_account()
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE broker_accounts SET cash_balance = ?, last_synced_at = ? WHERE id = ?",
+                (float(account.cash), now, broker_row["id"]),
+            )
+            conn.commit()
+            typer.echo(f"Synced '{profile}': cash=${account.cash:.2f}")
+        except RuntimeError as exc:
+            typer.echo(f"Error syncing '{profile}': {exc}", err=True)
+
+
+@broker_app.command("remove")
+def broker_remove(
+    profile_name: str = typer.Argument(..., help="Broker profile to remove"),
+) -> None:
+    """Remove a registered broker account."""
+    conn = get_connection()
+    init_db(conn)
+
+    row = conn.execute(
+        "SELECT id FROM broker_accounts WHERE profile_name = ?",
+        (profile_name,),
+    ).fetchone()
+
+    if row is None:
+        typer.echo(f"Error: Broker account '{profile_name}' not found.", err=True)
+        raise typer.Exit(1)
+
+    attached = conn.execute(
+        "SELECT name FROM strategies WHERE broker_account_id = ?",
+        (row["id"],),
+    ).fetchall()
+
+    if attached:
+        names = ", ".join(s["name"] for s in attached)
+        typer.echo(
+            f"Error: Cannot remove '{profile_name}': strategies still attached: {names}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    conn.execute("DELETE FROM broker_accounts WHERE id = ?", (row["id"],))
+    conn.commit()
+    typer.echo(f"Broker account '{profile_name}' removed.")
