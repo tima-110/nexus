@@ -264,6 +264,14 @@ def order_close(
     strat = _lookup_strategy(conn, strategy)
     strategy_id: int = strat["id"]
 
+    config = load_config()
+    audit_path = get_audit_path(config)
+
+    broker_profile: str = strat["broker_profile"]
+    broker = AlpacaBroker(broker_profile)
+
+    sync_outstanding_orders(conn, strategy_id, broker)
+
     position = conn.execute(
         "SELECT qty, reserved_qty FROM positions WHERE strategy_id = ? AND symbol = ? AND qty > 0",
         (strategy_id, symbol),
@@ -276,14 +284,6 @@ def order_close(
     if available <= 0:
         typer.echo(f"Error: no available shares to sell for {symbol} (all reserved).", err=True)
         raise typer.Exit(1)
-
-    config = load_config()
-    audit_path = get_audit_path(config)
-
-    broker_profile: str = strat["broker_profile"]
-    broker = AlpacaBroker(broker_profile)
-
-    sync_outstanding_orders(conn, strategy_id, broker)
 
     ok, reason = check_sell_guard(conn, strategy_id, symbol, available)
     if not ok:
