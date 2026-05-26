@@ -137,7 +137,7 @@ class TestGetOrder:
 
 class TestGetLastPrice:
     def test_returns_decimal_from_list_response(self):
-        data = [{"ap": "173.50"}]
+        data = {"trade": {"p": "173.50"}}
         broker = AlpacaBroker("paper1")
         with patch("subprocess.run", return_value=_make_run_result(data)):
             price = broker.get_last_price("AAPL")
@@ -145,8 +145,8 @@ class TestGetLastPrice:
         assert price == Decimal("173.50")
         assert isinstance(price, Decimal)
 
-    def test_returns_decimal_from_dict_response(self):
-        data = {"quotes": {"AAPL": [{"ap": "200.00"}]}}
+    def test_returns_decimal_from_price_field(self):
+        data = {"trade": {"price": "200.00"}}
         broker = AlpacaBroker("paper1")
         with patch("subprocess.run", return_value=_make_run_result(data)):
             price = broker.get_last_price("AAPL")
@@ -154,7 +154,7 @@ class TestGetLastPrice:
         assert price == Decimal("200.00")
 
     def test_raises_if_no_price_field(self):
-        data = [{"no_price_here": True}]
+        data = {"trade": {"no_price_here": True}}
         broker = AlpacaBroker("paper1")
         with patch("subprocess.run", return_value=_make_run_result(data)):
             with pytest.raises(RuntimeError, match="no price field"):

@@ -51,7 +51,7 @@ class AlpacaBroker:
         **params,
     ) -> BrokerOrder:
         args = [
-            "orders", "submit",
+            "order", "submit",
             "--symbol", symbol,
             "--qty", str(qty),
             "--side", side,
@@ -69,22 +69,22 @@ class AlpacaBroker:
         return self._order_from_dict(data)
 
     def get_order(self, broker_order_id: str) -> BrokerOrder:
-        data = self._run("orders", "get", "--order-id", broker_order_id)
+        data = self._run("order", "get", "--order-id", broker_order_id)
         return self._order_from_dict(data)
 
     def get_order_by_client_id(self, client_order_id: str) -> BrokerOrder:
-        data = self._run("orders", "get-by-client-id", "--client-order-id", client_order_id)
+        data = self._run("order", "get-by-client-id", "--client-order-id", client_order_id)
         return self._order_from_dict(data)
 
     def list_orders(self, status: str = "open") -> list[BrokerOrder]:
-        data = self._run("orders", "list", "--status", status)
+        data = self._run("order", "list", "--status", status)
         return [self._order_from_dict(item) for item in data]
 
     def cancel_order(self, broker_order_id: str) -> None:
-        self._run("orders", "cancel", "--order-id", broker_order_id)
+        self._run("order", "cancel", "--order-id", broker_order_id)
 
     def get_account(self) -> BrokerAccount:
-        data = self._run("accounts", "get")
+        data = self._run("account", "get")
         return BrokerAccount(
             cash=Decimal(str(data["cash"])),
             buying_power=Decimal(str(data["buying_power"])),
@@ -92,7 +92,7 @@ class AlpacaBroker:
         )
 
     def get_positions(self) -> list[BrokerPosition]:
-        data = self._run("positions", "list")
+        data = self._run("position", "list")
         return [
             BrokerPosition(
                 symbol=item["symbol"],
@@ -105,15 +105,13 @@ class AlpacaBroker:
         ]
 
     def get_last_price(self, symbol: str) -> Decimal:
-        data = self._run("data", "quotes", "--symbol", symbol)
-        # Alpaca quotes response: list of quote objects or a dict with nested quotes
-        if isinstance(data, list):
-            quote = data[-1]
+        data = self._run("data", "latest-trade", "--symbol", symbol)
+        # Response is a dict with trade data including a "price" or "p" field
+        if isinstance(data, dict):
+            trade = data.get("trade", data)
+            price = trade.get("p") or trade.get("price")
         else:
-            quotes = data.get("quotes", {}).get(symbol, [])
-            quote = quotes[-1] if quotes else data
-        # Ask price is the best available last-trade proxy from a quote
-        ask = quote.get("ap") or quote.get("ask_price") or quote.get("price")
-        if ask is None:
-            raise RuntimeError(f"Failed to parse Alpaca response: no price field in {quote}")
-        return Decimal(str(ask))
+            raise RuntimeError(f"Failed to parse Alpaca response: unexpected format {type(data)}")
+        if price is None:
+            raise RuntimeError(f"Failed to parse Alpaca response: no price field in {data}")
+        return Decimal(str(price))
