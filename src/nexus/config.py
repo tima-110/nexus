@@ -5,7 +5,7 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
-from platformdirs import user_config_path, user_data_path
+from platformdirs import user_config_path
 from pydantic import BaseModel, Field
 
 
@@ -64,20 +64,16 @@ def load_config() -> NexusConfig:
         config_path.write_text(_DEFAULT_CONFIG, encoding="utf-8")
         return NexusConfig()
 
-    with config_path.open("rb") as fh:
-        data = tomllib.load(fh)
+    try:
+        with config_path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as e:
+        raise RuntimeError(f"Invalid TOML in {config_path}: {e}") from e
 
-    sections: dict = {}
-    if "reconciler" in data:
-        sections["reconciler"] = ReconcilerConfig(**data["reconciler"])
-    if "order" in data:
-        sections["order"] = OrderConfig(**data["order"])
-    if "database" in data:
-        sections["database"] = DatabaseConfig(**data["database"])
-    if "audit_log" in data:
-        sections["audit_log"] = AuditLogConfig(**data["audit_log"])
-
-    return NexusConfig(**sections)
+    try:
+        return NexusConfig(**data)
+    except Exception as e:
+        raise RuntimeError(f"Invalid config in {config_path}: {e}") from e
 
 
 def get_db_path(config: NexusConfig | None = None) -> Path:
