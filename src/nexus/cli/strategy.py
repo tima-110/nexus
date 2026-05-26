@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import typer
 
 from nexus.db import get_connection, init_db
+from nexus.ledger import record_transaction
 
 strategy_app = typer.Typer(name="strategy", no_args_is_help=True)
 
@@ -71,3 +72,179 @@ def strategy_list() -> None:
             f"{row['id']:<5} {row['name']:<20} {row['broker']:<20}"
             f" {row['cash_balance']:>12.2f} {active:<8} {created}"
         )
+
+
+@strategy_app.command("show")
+def strategy_show(name: str = typer.Argument(..., help="Strategy name")) -> None:
+    """Show details for a strategy including positions and open orders."""
+    conn = get_connection()
+    init_db(conn)
+
+    row = conn.execute(
+        "SELECT s.*, b.profile_name AS broker"
+        " FROM strategies s"
+        " JOIN broker_accounts b ON s.broker_account_id = b.id"
+        " WHERE s.name = ?",
+        (name,),
+    ).fetchone()
+    if row is None:
+        typer.echo(f"Error: strategy '{name}' not found.", err=True)
+        raise typer.Exit(1)
+
+    strategy_id = row["id"]
+    positions = conn.execute(
+        "SELECT * FROM positions WHERE strategy_id = ? AND qty > 0",
+        (strategy_id,),
+    ).fetchall()
+    open_orders = conn.execute(
+        "SELECT * FROM orders WHERE strategy_id = ? AND status IN ('submitted', 'partially_filled')",
+        (strategy_id,),
+    ).fetchall()
+
+    position_value = sum(p["qty"] * (p["avg_entry_price"] or 0.0) for p in positions)
+    cash_balance = row["cash_balance"] or 0.0
+    total_value = cash_balance + position_value
+
+    active = "yes" if row["is_active"] else "no"
+    typer.echo(f"Strategy:       {row['name']}")
+    typer.echo(f"Broker:         {row['broker']}")
+    typer.echo(f"Active:         {active}")
+    typer.echo(f"Cash balance:   ${cash_balance:.2f}")
+    typer.echo(f"Position value: ${position_value:.2f}")
+    typer.echo(f"Total value:    ${total_value:.2f}")
+
+    if positions:
+        typer.echo("")
+        pos_header = f"{'SYMBOL':<10} {'QTY':>8} {'RESERVED':>10} {'AVAILABLE':>10} {'AVG_ENTRY':>12}"
+        typer.echo(pos_header)
+        typer.echo("-" * len(pos_header))
+        for p in positions:
+            reserved = p["reserved_qty"] or 0
+            available = p["qty"] - reserved
+            avg_entry = p["avg_entry_price"] or 0.0
+            typer.echo(
+                f"{p['symbol']:<10} {p['qty']:>8} {reserved:>10} {available:>10} {avg_entry:>12.4f}"
+            )
+
+    if open_orders:
+        typer.echo("")
+        ord_header = f"{'ID':<8} {'SYMBOL':<10} {'SIDE':<6} {'QTY':>8} {'TYPE':<12} {'STATUS'}"
+        typer.echo(ord_header)
+        typer.echo("-" * len(ord_header))
+        for o in open_orders:
+            typer.echo(
+                f"{o['id']:<8} {o['symbol']:<10} {o['side']:<6} {o['qty']:>8}"
+                f" {o['order_type']:<12} {o['status']}"
+            )
+
+
+@strategy_app.command("deposit")
+def strategy_deposit(
+    name: str = typer.Argument(..., help="Strategy name"),
+    amount: float = typer.Argument(..., help="Amount to deposit"),
+    note: str | None = typer.Option(None, "--note", help="Optional note"),
+) -> None:
+    """Deposit cash into a strategy."""
+    conn = get_connection()
+    init_db(conn)
+
+    row = conn.execute(
+        "SELECT id FROM strategies WHERE name = ?",
+        (name,),
+    ).fetchone()
+    if row is None:
+        typer.echo(f"Error: strategy '{name}' not found.", err=True)
+        raise typer.Exit(1)
+
+    strategy_id = row["id"]
+    record_transaction(conn, strategy_id, None, "deposit", amount, "cli:manual", note)
+    conn.commit()
+
+    new_balance = conn.execute(
+        "SELECT cash_balance FROM strategies WHERE id = ?",
+        (strategy_id,),
+    ).fetchone()["cash_balance"]
+    typer.echo(f"Deposited ${amount:.2f} to '{name}'. New balance: ${new_balance:.2f}")
+
+
+@strategy_app.command("withdraw")
+def strategy_withdraw(
+    name: str = typer.Argument(..., help="Strategy name"),
+    amount: float = typer.Argument(..., help="Amount to withdraw"),
+    note: str | None = typer.Option(None, "--note", help="Optional note"),
+) -> None:
+    """Withdraw cash from a strategy."""
+    conn = get_connection()
+    init_db(conn)
+
+    row = conn.execute(
+        "SELECT id, cash_balance FROM strategies WHERE name = ?",
+        (name,),
+    ).fetchone()
+    if row is None:
+        typer.echo(f"Error: strategy '{name}' not found.", err=True)
+        raise typer.Exit(1)
+
+    strategy_id = row["id"]
+    cash_balance = row["cash_balance"] or 0.0
+    if cash_balance < amount:
+        typer.echo(
+            f"Error: Insufficient balance (have ${cash_balance:.2f}, requested ${amount:.2f})",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    record_transaction(conn, strategy_id, None, "withdrawal", -amount, "cli:manual", note)
+    conn.commit()
+
+    new_balance = conn.execute(
+        "SELECT cash_balance FROM strategies WHERE id = ?",
+        (strategy_id,),
+    ).fetchone()["cash_balance"]
+    typer.echo(f"Withdrew ${amount:.2f} from '{name}'. New balance: ${new_balance:.2f}")
+
+
+@strategy_app.command("set-broker")
+def strategy_set_broker(
+    name: str = typer.Argument(..., help="Strategy name"),
+    broker: str = typer.Option(..., "--broker", help="New broker profile name"),
+) -> None:
+    """Change the broker account for a strategy."""
+    conn = get_connection()
+    init_db(conn)
+
+    strategy_row = conn.execute(
+        "SELECT id FROM strategies WHERE name = ?",
+        (name,),
+    ).fetchone()
+    if strategy_row is None:
+        typer.echo(f"Error: strategy '{name}' not found.", err=True)
+        raise typer.Exit(1)
+
+    broker_row = conn.execute(
+        "SELECT id FROM broker_accounts WHERE profile_name = ?",
+        (broker,),
+    ).fetchone()
+    if broker_row is None:
+        typer.echo(f"Error: broker account '{broker}' not found.", err=True)
+        raise typer.Exit(1)
+
+    strategy_id = strategy_row["id"]
+    open_count = conn.execute(
+        "SELECT count(*) AS cnt FROM orders"
+        " WHERE strategy_id = ? AND status IN ('submitted', 'partially_filled')",
+        (strategy_id,),
+    ).fetchone()["cnt"]
+    if open_count > 0:
+        typer.echo(
+            f"Error: Cannot change broker while orders are open ({open_count} open orders)",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    conn.execute(
+        "UPDATE strategies SET broker_account_id = ? WHERE id = ?",
+        (broker_row["id"], strategy_id),
+    )
+    conn.commit()
+    typer.echo(f"Strategy '{name}' now using broker '{broker}'.")
