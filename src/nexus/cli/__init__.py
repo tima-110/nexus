@@ -8,3 +8,15 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+
+from nexus.cli.broker_cmd import broker_app  # noqa: E402
+from nexus.cli.strategy import strategy_app  # noqa: E402
+from nexus.cli.order import order_app  # noqa: E402
+from nexus.cli.position import position_app  # noqa: E402
+from nexus.cli.ops import ops_app  # noqa: E402
+
+app.add_typer(broker_app)
+app.add_typer(strategy_app)
+app.add_typer(order_app)
+app.add_typer(position_app)
+app.add_typer(ops_app, name="history")
