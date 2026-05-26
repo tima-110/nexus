@@ -12,11 +12,14 @@ class AlpacaBroker:
         self.profile_name = profile_name
 
     def _run(self, *args: str) -> dict | list:
-        result = subprocess.run(
-            ["alpaca", *args, "--profile", self.profile_name],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                ["alpaca", *args, "--profile", self.profile_name],
+                capture_output=True,
+                text=True,
+            )
+        except OSError as e:
+            raise RuntimeError(f"Alpaca CLI not found or not executable: {e}") from e
         if result.returncode != 0:
             raise RuntimeError(f"Alpaca CLI error: {result.stderr}")
         try:
