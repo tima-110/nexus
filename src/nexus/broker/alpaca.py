@@ -83,6 +83,29 @@ class AlpacaBroker:
     def cancel_order(self, broker_order_id: str) -> None:
         self._run("order", "cancel", "--order-id", broker_order_id)
 
+    def replace_order(
+        self,
+        broker_order_id: str,
+        qty: int | None = None,
+        limit_price: float | None = None,
+        stop_price: float | None = None,
+        trail: float | None = None,
+        time_in_force: str | None = None,
+    ) -> BrokerOrder:
+        args = ["order", "replace", "--order-id", broker_order_id]
+        if qty is not None:
+            args += ["--qty", str(qty)]
+        if limit_price is not None:
+            args += ["--limit-price", str(limit_price)]
+        if stop_price is not None:
+            args += ["--stop-price", str(stop_price)]
+        if trail is not None:
+            args += ["--trail", str(trail)]
+        if time_in_force is not None:
+            args += ["--time-in-force", time_in_force]
+        data = self._run(*args)
+        return self._order_from_dict(data)
+
     def get_account(self) -> BrokerAccount:
         data = self._run("account", "get")
         return BrokerAccount(

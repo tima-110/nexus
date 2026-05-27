@@ -415,6 +415,87 @@ def order_cancel(
     typer.echo(f"Order {order_id} cancelled.")
 
 
+@order_app.command("replace")
+def order_replace(
+    order_id: int = typer.Argument(..., help="Nexus order ID"),
+    qty: int | None = typer.Option(None, "--qty", help="New quantity"),
+    limit_price: float | None = typer.Option(None, "--limit-price", help="New limit price"),
+    stop_price: float | None = typer.Option(None, "--stop-price", help="New stop price"),
+    trail: float | None = typer.Option(None, "--trail", help="New trail value"),
+    time_in_force: str | None = typer.Option(None, "--time-in-force", "-t", help="New time in force"),
+) -> None:
+    """Replace (modify) an existing order."""
+    conn = get_connection()
+    init_db(conn)
+
+    # Look up the order
+    row = conn.execute(
+        "SELECT broker_order_id, strategy_id FROM orders WHERE id = ?",
+        (order_id,),
+    ).fetchone()
+    if row is None:
+        json_output({"error": f"order {order_id} not found"})
+        typer.echo("Error: Order not found.", err=True)
+        raise typer.Exit(1)
+
+    broker_order_id = row["broker_order_id"]
+    if broker_order_id is None:
+        json_output({"error": f"order {order_id} has no broker_order_id (not yet submitted)"})
+        typer.echo("Error: Order has no broker_order_id (not yet submitted).", err=True)
+        raise typer.Exit(1)
+
+    # Get strategy's broker profile
+    strategy = conn.execute(
+        "SELECT ba.profile_name FROM strategies s JOIN broker_accounts ba ON s.broker_account_id = ba.id WHERE s.id = ?",
+        (row["strategy_id"],),
+    ).fetchone()
+
+    try:
+        broker = AlpacaBroker(strategy["profile_name"])
+        new_order = broker.replace_order(
+            broker_order_id,
+            qty=qty,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            trail=trail,
+            time_in_force=time_in_force,
+        )
+    except RuntimeError as exc:
+        json_output({"error": f"Broker error: {exc}"})
+        typer.echo(f"Broker error: {exc}", err=True)
+        raise typer.Exit(1)
+
+    # Update local DB with new values
+    updates = []
+    params = []
+    if qty is not None:
+        updates.append("qty = ?")
+        params.append(qty)
+    if limit_price is not None:
+        updates.append("limit_price = ?")
+        params.append(limit_price)
+    if stop_price is not None:
+        updates.append("stop_price = ?")
+        params.append(stop_price)
+    if new_order.broker_order_id != broker_order_id:
+        updates.append("broker_order_id = ?")
+        params.append(new_order.broker_order_id)
+
+    if updates:
+        updates.append("updated_at = ?")
+        params.append(_now())
+        params.append(order_id)
+        conn.execute(f"UPDATE orders SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+
+    # JSON output
+    data = {"status": "ok", "order_id": order_id, "new_broker_order_id": new_order.broker_order_id}
+    if json_output(data):
+        return
+
+    typer.echo(f"Order {order_id} replaced. New broker order: {new_order.broker_order_id}")
+
+
 @order_app.command("status")
 def order_status(
     order_id: int = typer.Argument(..., help="Order ID"),
