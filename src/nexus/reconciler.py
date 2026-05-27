@@ -59,16 +59,27 @@ def _sync_balances(conn: sqlite3.Connection, result: ReconcileResult, dry_run: b
             result.errors.append(f"balance_sync({profile_name}): {e}")
 
 
-def _sync_orders(conn: sqlite3.Connection, result: ReconcileResult) -> None:
+def _sync_orders(conn: sqlite3.Connection, result: ReconcileResult, strategy_name: str | None = None) -> None:
     """Step 2: Sync outstanding orders for each active strategy."""
-    rows = conn.execute(
-        """
-        SELECT s.id AS strategy_id, ba.profile_name
-        FROM strategies s
-        JOIN broker_accounts ba ON s.broker_account_id = ba.id
-        WHERE s.is_active = 1
-        """
-    ).fetchall()
+    if strategy_name is not None:
+        rows = conn.execute(
+            """
+            SELECT s.id AS strategy_id, ba.profile_name
+            FROM strategies s
+            JOIN broker_accounts ba ON s.broker_account_id = ba.id
+            WHERE s.is_active = 1 AND s.name = ?
+            """,
+            (strategy_name,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT s.id AS strategy_id, ba.profile_name
+            FROM strategies s
+            JOIN broker_accounts ba ON s.broker_account_id = ba.id
+            WHERE s.is_active = 1
+            """
+        ).fetchall()
 
     for row in rows:
         strategy_id = row["strategy_id"]
@@ -135,6 +146,7 @@ def run_reconcile(
     conn: sqlite3.Connection,
     config: NexusConfig,
     dry_run: bool = False,
+    strategy_name: str | None = None,
 ) -> ReconcileResult:
     """Run a full reconciliation sweep.
 
@@ -142,6 +154,7 @@ def run_reconcile(
         conn: SQLite connection with Row row_factory.
         config: Nexus configuration (includes reconciler settings).
         dry_run: If True, report what would change without modifying data.
+        strategy_name: If provided, only reconcile orders for this strategy.
 
     Returns:
         ReconcileResult summarizing actions taken.
@@ -155,7 +168,7 @@ def run_reconcile(
         _sync_balances(conn, result, dry_run)
 
     # Step 2: Order sync (always runs)
-    _sync_orders(conn, result)
+    _sync_orders(conn, result, strategy_name=strategy_name)
 
     # Step 3: Bypass detection (skip outside market hours if configured)
     if not outside_market:

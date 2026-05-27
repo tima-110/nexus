@@ -14,13 +14,24 @@ app = typer.Typer(
 _json_output: bool = False
 
 
-@app.callback()
+def _version_callback(value: bool) -> None:
+    if value:
+        from nexus import __version__
+        typer.echo(f"nexus {__version__}")
+        raise typer.Exit()
+
+
+@app.callback(invoke_without_command=True)
 def main(
+    ctx: typer.Context,
     json_flag: bool = typer.Option(False, "--json", help="Output as JSON"),
+    version: bool = typer.Option(False, "--version", callback=_version_callback, is_eager=True, help="Print version and exit"),
 ) -> None:
     """Nexus — multi-strategy portfolio manager."""
     global _json_output
     _json_output = json_flag
+    if ctx.invoked_subcommand is None and not json_flag:
+        raise typer.Exit()
 
 
 def json_output(data) -> bool:
@@ -48,6 +59,7 @@ app.add_typer(config_app)
 @app.command()
 def reconcile(
     dry_run: bool = typer.Option(False, "--dry-run", help="Report without making changes"),
+    strategy: str | None = typer.Option(None, "--strategy", "-s", help="Reconcile only this strategy"),
 ) -> None:
     """Run the reconciliation sweep."""
     from nexus.config import load_config
@@ -58,7 +70,7 @@ def reconcile(
     conn = get_connection()
     init_db(conn)
 
-    result = run_reconcile(conn, config, dry_run=dry_run)
+    result = run_reconcile(conn, config, dry_run=dry_run, strategy_name=strategy)
 
     if json_output({
         "orders_synced": result.orders_synced,
