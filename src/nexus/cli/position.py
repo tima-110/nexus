@@ -97,7 +97,7 @@ def position_show(
     ).fetchone()
     if position is None or (position["qty"] or 0) <= 0:
         json_output({"error": f"No position in {symbol} for strategy '{strategy}'"})
-        typer.echo(f"No position in {symbol} for strategy '{strategy}'", err=True)
+        typer.echo(f"Error: No position in {symbol} for strategy '{strategy}'.", err=True)
         raise typer.Exit(1)
 
     qty = position["qty"] or 0
