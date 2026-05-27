@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import typer
 
+from nexus.cli import json_output
 from nexus.db import get_connection, init_db
 
 ops_app = typer.Typer(no_args_is_help=False)
@@ -41,6 +42,16 @@ def history(
     query += " ORDER BY t.created_at DESC"
 
     rows = conn.execute(query, params).fetchall()
+
+    if json_output({"items": [
+        {
+            "date": row["created_at"], "type": row["type"],
+            "amount": row["amount"] or 0.0, "strategy": row["strategy"],
+            "symbol": row["symbol"], "actor": row["actor"], "note": row["note"],
+        }
+        for row in rows
+    ]}):
+        return
 
     if not rows:
         typer.echo("No transactions found.")

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import typer
 
 from nexus.broker import AlpacaBroker
+from nexus.cli import json_output
 from nexus.db import get_connection, init_db
 
 broker_app = typer.Typer(name="broker", no_args_is_help=True)
@@ -28,9 +29,12 @@ def broker_add(
         )
         conn.commit()
     except Exception as exc:
+        json_output({"error": str(exc)})
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
 
+    if json_output({"status": "ok", "profile_name": profile_name}):
+        return
     typer.echo(f"Broker account '{profile_name}' registered (margin_multiplier={margin_multiplier}).")
 
 
@@ -44,6 +48,12 @@ def broker_list() -> None:
         "SELECT id, profile_name, margin_multiplier, cash_balance, last_synced_at"
         " FROM broker_accounts ORDER BY id"
     ).fetchall()
+
+    if json_output({"items": [
+        {"id": r["id"], "profile_name": r["profile_name"], "margin_multiplier": r["margin_multiplier"], "cash_balance": r["cash_balance"], "last_synced_at": r["last_synced_at"]}
+        for r in rows
+    ]}):
+        return
 
     if not rows:
         typer.echo("No broker accounts registered.")
@@ -76,24 +86,53 @@ def broker_show(
     ).fetchone()
 
     if row is None:
+        json_output({"error": f"Broker account '{profile_name}' not found"})
         typer.echo(f"Error: Broker account '{profile_name}' not found.", err=True)
         raise typer.Exit(1)
+
+    # Collect live data for JSON output
+    live_account = None
+    live_positions = None
+    try:
+        broker = AlpacaBroker(profile_name)
+        account = broker.get_account()
+        positions = broker.get_positions()
+        live_account = {"cash": account.cash, "buying_power": account.buying_power, "equity": account.equity}
+        live_positions = [
+            {"symbol": p.symbol, "qty": p.qty, "avg_entry_price": p.avg_entry_price, "current_price": p.current_price, "unrealized_pl": p.unrealized_pl}
+            for p in positions
+        ]
+    except RuntimeError:
+        pass
+
+    strategies = conn.execute(
+        "SELECT name, cash_balance FROM strategies WHERE broker_account_id = ?",
+        (row["id"],),
+    ).fetchall()
+
+    if json_output({
+        "profile_name": row["profile_name"],
+        "margin_multiplier": row["margin_multiplier"],
+        "cached_cash": row["cash_balance"],
+        "last_synced_at": row["last_synced_at"],
+        "live_account": live_account,
+        "live_positions": live_positions,
+        "strategies": [{"name": s["name"], "cash_balance": s["cash_balance"]} for s in strategies],
+    }):
+        return
 
     typer.echo(f"Profile:           {row['profile_name']}")
     typer.echo(f"Margin multiplier: {row['margin_multiplier']:.2f}")
     typer.echo(f"Cached cash:       ${row['cash_balance']:.2f}")
     typer.echo(f"Last synced:       {row['last_synced_at'] or 'never'}")
 
-    try:
-        broker = AlpacaBroker(profile_name)
-        account = broker.get_account()
-        positions = broker.get_positions()
+    if live_account is not None:
         typer.echo("")
         typer.echo("Live account:")
         typer.echo(f"  Cash:         ${account.cash:.2f}")
         typer.echo(f"  Buying power: ${account.buying_power:.2f}")
         typer.echo(f"  Equity:       ${account.equity:.2f}")
-        if positions:
+        if live_positions:
             typer.echo("")
             typer.echo("Live positions:")
             typer.echo(f"  {'SYMBOL':<10} {'QTY':>8} {'AVG_ENTRY':>12} {'CUR_PRICE':>12} {'UNREAL_PL':>12}")
@@ -107,13 +146,8 @@ def broker_show(
                 )
         else:
             typer.echo("  (no open positions)")
-    except RuntimeError as exc:
-        typer.echo(f"(Live data unavailable: {exc})")
-
-    strategies = conn.execute(
-        "SELECT name, cash_balance FROM strategies WHERE broker_account_id = ?",
-        (row["id"],),
-    ).fetchall()
+    else:
+        typer.echo("(Live data unavailable)")
 
     typer.echo("")
     if strategies:
@@ -140,6 +174,7 @@ def broker_sync(
             (profile_name,),
         ).fetchone()
         if row is None:
+            json_output({"error": f"Broker account '{profile_name}' not found"})
             typer.echo(f"Error: Broker account '{profile_name}' not found.", err=True)
             raise typer.Exit(1)
         brokers = [row]
@@ -149,9 +184,13 @@ def broker_sync(
         ).fetchall()
 
     if not brokers:
+        if json_output({"items": [], "errors": []}):
+            return
         typer.echo("No broker accounts registered.")
         return
 
+    synced_items: list[dict] = []
+    errors: list[str] = []
     for broker_row in brokers:
         profile = broker_row["profile_name"]
         try:
@@ -162,9 +201,17 @@ def broker_sync(
                 (float(account.cash), now, broker_row["id"]),
             )
             conn.commit()
-            typer.echo(f"Synced '{profile}': cash=${account.cash:.2f}")
+            synced_items.append({"profile": profile, "cash": float(account.cash)})
         except RuntimeError as exc:
-            typer.echo(f"Error syncing '{profile}': {exc}", err=True)
+            errors.append(f"{profile}: {exc}")
+
+    if json_output({"items": synced_items, "errors": errors}):
+        return
+
+    for item in synced_items:
+        typer.echo(f"Synced '{item['profile']}': cash=${item['cash']:.2f}")
+    for err in errors:
+        typer.echo(f"Error syncing {err}", err=True)
 
 
 @broker_app.command("remove")
@@ -181,6 +228,7 @@ def broker_remove(
     ).fetchone()
 
     if row is None:
+        json_output({"error": f"Broker account '{profile_name}' not found"})
         typer.echo(f"Error: Broker account '{profile_name}' not found.", err=True)
         raise typer.Exit(1)
 
@@ -191,6 +239,7 @@ def broker_remove(
 
     if attached:
         names = ", ".join(s["name"] for s in attached)
+        json_output({"error": f"Cannot remove '{profile_name}': strategies still attached: {names}"})
         typer.echo(
             f"Error: Cannot remove '{profile_name}': strategies still attached: {names}",
             err=True,
@@ -199,4 +248,6 @@ def broker_remove(
 
     conn.execute("DELETE FROM broker_accounts WHERE id = ?", (row["id"],))
     conn.commit()
+    if json_output({"status": "ok", "profile_name": profile_name}):
+        return
     typer.echo(f"Broker account '{profile_name}' removed.")

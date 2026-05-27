@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 import typer
 
+from nexus.cli import json_output
 from nexus.db import get_connection, init_db
 from nexus.ledger import record_transaction
 
@@ -26,22 +27,26 @@ def strategy_create(
         (broker,),
     ).fetchone()
     if broker_row is None:
+        json_output({"error": f"broker account '{broker}' not found"})
         typer.echo(f"Error: broker account '{broker}' not found.", err=True)
         raise typer.Exit(1)
 
     broker_account_id = broker_row["id"]
 
     try:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO strategies (name, broker_account_id, cash_balance, is_active, created_at)"
             " VALUES (?, ?, ?, 1, ?)",
             (name, broker_account_id, balance, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
     except Exception as exc:
+        json_output({"error": str(exc)})
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
 
+    if json_output({"status": "ok", "name": name, "strategy_id": cur.lastrowid}):
+        return
     typer.echo(f"Strategy '{name}' created (broker={broker}, balance={balance:.2f}).")
 
 
@@ -57,6 +62,12 @@ def strategy_list() -> None:
         " JOIN broker_accounts b ON s.broker_account_id = b.id"
         " ORDER BY s.id"
     ).fetchall()
+
+    if json_output({"items": [
+        {"name": r["name"], "cash_balance": r["cash_balance"], "broker": r["broker"], "is_active": bool(r["is_active"])}
+        for r in rows
+    ]}):
+        return
 
     if not rows:
         typer.echo("No strategies found.")
@@ -88,6 +99,7 @@ def strategy_show(name: str = typer.Argument(..., help="Strategy name")) -> None
         (name,),
     ).fetchone()
     if row is None:
+        json_output({"error": f"strategy '{name}' not found"})
         typer.echo(f"Error: strategy '{name}' not found.", err=True)
         raise typer.Exit(1)
 
@@ -104,6 +116,22 @@ def strategy_show(name: str = typer.Argument(..., help="Strategy name")) -> None
     position_value = sum(p["qty"] * (p["avg_entry_price"] or 0.0) for p in positions)
     cash_balance = row["cash_balance"] or 0.0
     total_value = cash_balance + position_value
+
+    if json_output({
+        "name": row["name"],
+        "cash_balance": cash_balance,
+        "broker_profile": row["broker"],
+        "is_active": bool(row["is_active"]),
+        "positions": [
+            {"symbol": p["symbol"], "qty": p["qty"], "reserved_qty": p["reserved_qty"] or 0, "avg_entry_price": p["avg_entry_price"]}
+            for p in positions
+        ],
+        "open_orders": [
+            {"id": o["id"], "symbol": o["symbol"], "side": o["side"], "qty": o["qty"], "order_type": o["order_type"], "status": o["status"]}
+            for o in open_orders
+        ],
+    }):
+        return
 
     active = "yes" if row["is_active"] else "no"
     typer.echo(f"Strategy:       {row['name']}")
@@ -153,6 +181,7 @@ def strategy_deposit(
         (name,),
     ).fetchone()
     if row is None:
+        json_output({"error": f"strategy '{name}' not found"})
         typer.echo(f"Error: strategy '{name}' not found.", err=True)
         raise typer.Exit(1)
 
@@ -164,6 +193,8 @@ def strategy_deposit(
         "SELECT cash_balance FROM strategies WHERE id = ?",
         (strategy_id,),
     ).fetchone()["cash_balance"]
+    if json_output({"status": "ok", "new_balance": new_balance}):
+        return
     typer.echo(f"Deposited ${amount:.2f} to '{name}'. New balance: ${new_balance:.2f}")
 
 
@@ -182,12 +213,14 @@ def strategy_withdraw(
         (name,),
     ).fetchone()
     if row is None:
+        json_output({"error": f"strategy '{name}' not found"})
         typer.echo(f"Error: strategy '{name}' not found.", err=True)
         raise typer.Exit(1)
 
     strategy_id = row["id"]
     cash_balance = row["cash_balance"] or 0.0
     if cash_balance < amount:
+        json_output({"error": f"Insufficient balance (have ${cash_balance:.2f}, requested ${amount:.2f})"})
         typer.echo(
             f"Error: Insufficient balance (have ${cash_balance:.2f}, requested ${amount:.2f})",
             err=True,
@@ -201,6 +234,8 @@ def strategy_withdraw(
         "SELECT cash_balance FROM strategies WHERE id = ?",
         (strategy_id,),
     ).fetchone()["cash_balance"]
+    if json_output({"status": "ok", "new_balance": new_balance}):
+        return
     typer.echo(f"Withdrew ${amount:.2f} from '{name}'. New balance: ${new_balance:.2f}")
 
 
@@ -218,6 +253,7 @@ def strategy_set_broker(
         (name,),
     ).fetchone()
     if strategy_row is None:
+        json_output({"error": f"strategy '{name}' not found"})
         typer.echo(f"Error: strategy '{name}' not found.", err=True)
         raise typer.Exit(1)
 
@@ -226,6 +262,7 @@ def strategy_set_broker(
         (broker,),
     ).fetchone()
     if broker_row is None:
+        json_output({"error": f"broker account '{broker}' not found"})
         typer.echo(f"Error: broker account '{broker}' not found.", err=True)
         raise typer.Exit(1)
 
@@ -236,6 +273,7 @@ def strategy_set_broker(
         (strategy_id,),
     ).fetchone()["cnt"]
     if open_count > 0:
+        json_output({"error": f"Cannot change broker while orders are open ({open_count} open orders)"})
         typer.echo(
             f"Error: Cannot change broker while orders are open ({open_count} open orders)",
             err=True,
@@ -247,4 +285,7 @@ def strategy_set_broker(
         (broker_row["id"], strategy_id),
     )
     conn.commit()
-    typer.echo(f"Strategy '{name}' now using broker '{broker}'.")
+    msg = f"Strategy '{name}' now using broker '{broker}'."
+    if json_output({"status": "ok", "message": msg}):
+        return
+    typer.echo(msg)

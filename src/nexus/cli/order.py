@@ -8,6 +8,7 @@ import typer
 
 from nexus.audit import log_event
 from nexus.broker import AlpacaBroker
+from nexus.cli import json_output
 from nexus.config import load_config, get_audit_path
 from nexus.db import get_connection, init_db
 from nexus.guards import check_buy_guard, check_sell_guard
@@ -38,6 +39,7 @@ def _lookup_strategy(conn, strategy_name: str) -> dict:
         (strategy_name,),
     ).fetchone()
     if row is None:
+        json_output({"error": f"strategy '{strategy_name}' not found"})
         typer.echo(f"Error: strategy '{strategy_name}' not found.", err=True)
         raise typer.Exit(1)
     return row
@@ -80,6 +82,7 @@ def order_buy(
         try:
             last_price = float(broker.get_last_price(symbol))
         except RuntimeError as exc:
+            json_output({"error": f"Error fetching price for {symbol}: {exc}"})
             typer.echo(f"Error fetching price for {symbol}: {exc}", err=True)
             raise typer.Exit(1)
         estimated_cost = last_price * qty * (1 + slippage)
@@ -87,6 +90,7 @@ def order_buy(
     # Buy guard
     ok, reason = check_buy_guard(conn, strategy_id, symbol, estimated_cost)
     if not ok:
+        json_output({"error": f"Buy blocked: {reason}"})
         typer.echo(f"Buy blocked: {reason}", err=True)
         raise typer.Exit(1)
 
@@ -129,6 +133,7 @@ def order_buy(
         )
         release_reservation(conn, order_id)
         conn.commit()
+        json_output({"error": f"Broker error: {exc}"})
         typer.echo(f"Broker error: {exc}", err=True)
         raise typer.Exit(1)
 
@@ -152,6 +157,8 @@ def order_buy(
         "actor": actor,
     })
 
+    if json_output({"status": "ok", "order_id": order_id, "client_order_id": client_order_id, "message": f"Order submitted: {client_order_id}"}):
+        return
     typer.echo(f"Order submitted: {client_order_id}")
 
 
@@ -184,6 +191,7 @@ def order_sell(
     # Sell guard
     ok, reason = check_sell_guard(conn, strategy_id, symbol, qty)
     if not ok:
+        json_output({"error": f"Sell blocked: {reason}"})
         typer.echo(f"Sell blocked: {reason}", err=True)
         raise typer.Exit(1)
 
@@ -226,6 +234,7 @@ def order_sell(
         )
         release_shares(conn, strategy_id, symbol, qty)
         conn.commit()
+        json_output({"error": f"Broker error: {exc}"})
         typer.echo(f"Broker error: {exc}", err=True)
         raise typer.Exit(1)
 
@@ -248,6 +257,8 @@ def order_sell(
         "actor": actor,
     })
 
+    if json_output({"status": "ok", "order_id": order_id, "client_order_id": client_order_id, "message": f"Order submitted: {client_order_id}"}):
+        return
     typer.echo(f"Order submitted: {client_order_id}")
 
 
@@ -277,16 +288,19 @@ def order_close(
         (strategy_id, symbol),
     ).fetchone()
     if position is None:
+        json_output({"error": f"no position in {symbol} for strategy '{strategy}'"})
         typer.echo(f"Error: no position in {symbol} for strategy '{strategy}'.", err=True)
         raise typer.Exit(1)
 
     available = position["qty"] - position["reserved_qty"]
     if available <= 0:
+        json_output({"error": f"no available shares to sell for {symbol} (all reserved)"})
         typer.echo(f"Error: no available shares to sell for {symbol} (all reserved).", err=True)
         raise typer.Exit(1)
 
     ok, reason = check_sell_guard(conn, strategy_id, symbol, available)
     if not ok:
+        json_output({"error": f"Sell blocked: {reason}"})
         typer.echo(f"Sell blocked: {reason}", err=True)
         raise typer.Exit(1)
 
@@ -314,6 +328,7 @@ def order_close(
         )
         release_shares(conn, strategy_id, symbol, available)
         conn.commit()
+        json_output({"error": f"Broker error: {exc}"})
         typer.echo(f"Broker error: {exc}", err=True)
         raise typer.Exit(1)
 
@@ -336,6 +351,8 @@ def order_close(
         "actor": actor,
     })
 
+    if json_output({"status": "ok", "order_id": order_id, "client_order_id": client_order_id, "message": f"Order submitted: {client_order_id}"}):
+        return
     typer.echo(f"Order submitted: {client_order_id}")
 
 
@@ -361,11 +378,13 @@ def order_cancel(
     ).fetchone()
 
     if order is None:
+        json_output({"error": f"order {order_id} not found"})
         typer.echo(f"Error: order {order_id} not found.", err=True)
         raise typer.Exit(1)
 
     cancellable = {OrderStatus.submitted.value, OrderStatus.partially_filled.value}
     if order["status"] not in cancellable:
+        json_output({"error": f"order {order_id} has status '{order['status']}' and cannot be cancelled"})
         typer.echo(
             f"Error: order {order_id} has status '{order['status']}' and cannot be cancelled.",
             err=True,
@@ -376,6 +395,7 @@ def order_cancel(
     try:
         broker.cancel_order(order["broker_order_id"])
     except RuntimeError as exc:
+        json_output({"error": f"Broker error while cancelling: {exc}"})
         typer.echo(f"Broker error while cancelling: {exc}", err=True)
         raise typer.Exit(1)
 
@@ -390,6 +410,8 @@ def order_cancel(
         "actor": order["actor"] or "cli:manual",
     })
 
+    if json_output({"status": "ok", "order_id": order_id}):
+        return
     typer.echo(f"Order {order_id} cancelled.")
 
 
@@ -407,8 +429,12 @@ def order_status(
     ).fetchone()
 
     if row is None:
+        json_output({"error": f"order {order_id} not found"})
         typer.echo(f"Error: order {order_id} not found.", err=True)
         raise typer.Exit(1)
+
+    if json_output(dict(row)):
+        return
 
     fields = row.keys()
     for field in fields:
@@ -447,6 +473,9 @@ def order_list(
     query += " ORDER BY o.id DESC"
 
     rows = conn.execute(query, params).fetchall()
+
+    if json_output({"items": [dict(row) for row in rows]}):
+        return
 
     if not rows:
         typer.echo("No orders found.")

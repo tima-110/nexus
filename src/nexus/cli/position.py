@@ -4,6 +4,7 @@ from __future__ import annotations
 import typer
 
 from nexus.broker import AlpacaBroker
+from nexus.cli import json_output
 from nexus.db import get_connection, init_db
 
 position_app = typer.Typer(name="position", no_args_is_help=True)
@@ -32,6 +33,17 @@ def position_list(
     query += " ORDER BY s.name, p.symbol"
 
     rows = conn.execute(query, params).fetchall()
+
+    if json_output({"items": [
+        {
+            "strategy": r["strategy_name"], "symbol": r["symbol"],
+            "qty": r["qty"] or 0, "reserved_qty": r["reserved_qty"] or 0,
+            "available": (r["qty"] or 0) - (r["reserved_qty"] or 0),
+            "avg_entry_price": r["avg_entry_price"] or 0.0,
+        }
+        for r in rows
+    ]}):
+        return
 
     if not rows:
         typer.echo("No open positions.")
@@ -72,6 +84,7 @@ def position_show(
         (strategy,),
     ).fetchone()
     if strat is None:
+        json_output({"error": f"strategy '{strategy}' not found"})
         typer.echo(f"Error: strategy '{strategy}' not found.", err=True)
         raise typer.Exit(1)
 
@@ -83,6 +96,7 @@ def position_show(
         (strategy_id, symbol),
     ).fetchone()
     if position is None or (position["qty"] or 0) <= 0:
+        json_output({"error": f"No position in {symbol} for strategy '{strategy}'"})
         typer.echo(f"No position in {symbol} for strategy '{strategy}'", err=True)
         raise typer.Exit(1)
 
@@ -92,6 +106,31 @@ def position_show(
     avg_entry = position["avg_entry_price"] or 0.0
     cost_basis = qty * avg_entry
 
+    live_price = None
+    broker = AlpacaBroker(broker_profile)
+    try:
+        current_price = broker.get_last_price(symbol)
+        live_price = float(current_price)
+    except RuntimeError:
+        pass
+
+    open_orders = conn.execute(
+        "SELECT id, side, qty, order_type, status FROM orders"
+        " WHERE strategy_id = ? AND symbol = ? AND status IN ('submitted', 'partially_filled')",
+        (strategy_id, symbol),
+    ).fetchall()
+
+    if json_output({
+        "strategy": strategy, "symbol": symbol, "qty": qty,
+        "reserved_qty": reserved, "available": available,
+        "avg_entry_price": avg_entry, "live_price": live_price,
+        "open_orders": [
+            {"id": o["id"], "side": o["side"], "qty": o["qty"], "order_type": o["order_type"], "status": o["status"]}
+            for o in open_orders
+        ],
+    }):
+        return
+
     typer.echo(f"Strategy:    {strategy}")
     typer.echo(f"Symbol:      {symbol}")
     typer.echo(f"Quantity:    {qty}")
@@ -100,22 +139,14 @@ def position_show(
     typer.echo(f"Avg entry:   ${avg_entry:.4f}")
     typer.echo(f"Cost basis:  ${cost_basis:.2f}")
 
-    broker = AlpacaBroker(broker_profile)
-    try:
-        current_price = broker.get_last_price(symbol)
-        market_value = qty * float(current_price)
+    if live_price is not None:
+        market_value = qty * live_price
         unrealized_pnl = market_value - cost_basis
-        typer.echo(f"Current px:  ${float(current_price):.4f}")
+        typer.echo(f"Current px:  ${live_price:.4f}")
         typer.echo(f"Mkt value:   ${market_value:.2f}")
         typer.echo(f"Unreal P&L:  ${unrealized_pnl:.2f}")
-    except RuntimeError:
+    else:
         typer.echo("Current px:  (Live price unavailable)")
-
-    open_orders = conn.execute(
-        "SELECT id, side, qty, order_type, status FROM orders"
-        " WHERE strategy_id = ? AND symbol = ? AND status IN ('submitted', 'partially_filled')",
-        (strategy_id, symbol),
-    ).fetchall()
 
     if open_orders:
         typer.echo("")

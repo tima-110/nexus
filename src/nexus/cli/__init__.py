@@ -1,6 +1,8 @@
 """CLI application — typer app with all subcommands."""
 from __future__ import annotations
 
+import json as _json
+
 import typer
 
 app = typer.Typer(
@@ -8,6 +10,25 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+
+_json_output: bool = False
+
+
+@app.callback()
+def main(
+    json_flag: bool = typer.Option(False, "--json", help="Output as JSON"),
+) -> None:
+    """Nexus — multi-strategy portfolio manager."""
+    global _json_output
+    _json_output = json_flag
+
+
+def json_output(data) -> bool:
+    """If JSON mode is active, print data as JSON and return True. Otherwise return False."""
+    if _json_output:
+        typer.echo(_json.dumps(data, default=str))
+        return True
+    return False
 
 from nexus.cli.broker_cmd import broker_app  # noqa: E402
 from nexus.cli.strategy import strategy_app  # noqa: E402
@@ -36,6 +57,19 @@ def reconcile(
     init_db(conn)
 
     result = run_reconcile(conn, config, dry_run=dry_run)
+
+    if json_output({
+        "orders_synced": result.orders_synced,
+        "orders_skipped": result.orders_skipped,
+        "orphans_cleaned": result.orphans_cleaned,
+        "bypass_orders": result.bypass_orders,
+        "balance_drift": result.balance_drift,
+        "errors": result.errors,
+        "dry_run": dry_run,
+    }):
+        if result.errors:
+            raise typer.Exit(1)
+        return
 
     if dry_run:
         typer.echo("[DRY RUN]")
@@ -74,10 +108,15 @@ def install(
 
     try:
         expression = install_schedule(minutes)
-        typer.echo(f"Reconciler installed: {expression}")
     except RuntimeError as exc:
+        if json_output({"error": str(exc)}):
+            raise typer.Exit(1)
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
+
+    if json_output({"status": "ok", "schedule": expression}):
+        return
+    typer.echo(f"Reconciler installed: {expression}")
 
 
 @app.command()
@@ -86,6 +125,8 @@ def uninstall() -> None:
     from nexus.schedule.cron import uninstall_schedule
 
     removed = uninstall_schedule()
+    if json_output({"status": "ok", "removed": removed}):
+        return
     if removed:
         typer.echo("Reconciler cron schedule removed.")
     else:
@@ -98,6 +139,12 @@ def status() -> None:
     from nexus.schedule.cron import get_schedule_status
 
     info = get_schedule_status()
+    if json_output({
+        "installed": info["installed"],
+        "schedule": info.get("schedule"),
+        "command": info.get("command"),
+    }):
+        return
     if info["installed"]:
         typer.echo(f"Status:   installed")
         typer.echo(f"Schedule: {info['schedule']}")
@@ -119,12 +166,18 @@ def doctor() -> None:
 
     checks = run_doctor(conn, config)
 
-    all_passed = True
+    all_passed = all(c.passed for c in checks)
+    if json_output({
+        "checks": [{"name": c.name, "passed": c.passed, "detail": c.detail} for c in checks],
+        "all_passed": all_passed,
+    }):
+        if not all_passed:
+            raise typer.Exit(1)
+        return
+
     for check in checks:
         icon = "PASS" if check.passed else "FAIL"
         typer.echo(f"  [{icon}] {check.name}: {check.detail}")
-        if not check.passed:
-            all_passed = False
 
     typer.echo("")
     if all_passed:
