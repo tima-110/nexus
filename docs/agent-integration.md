@@ -74,6 +74,8 @@ nexus --json order buy AAPL 10 --strategy my_strat
 | `nexus --json order list --strategy <name> --status open` | List open orders | List |
 | `nexus --json position list --strategy <name>` | List positions | List |
 | `nexus --json position show <strategy> <symbol>` | Show one position | Single entity |
+| `nexus --json strategy delete <name> --yes` | Delete a strategy | Confirmation |
+| `nexus --json strategy delete <name> --liquidate --yes` | Liquidate and delete | Confirmation |
 | `nexus --json reconcile --strategy <name>` | Force sync with broker | Reconcile result |
 
 ---

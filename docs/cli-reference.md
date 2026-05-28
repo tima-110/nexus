@@ -361,6 +361,34 @@ nexus strategy set-broker momentum --broker live
 
 ---
 
+### `nexus strategy delete`
+
+Delete a strategy and all its history. Fails if the strategy has open orders or positions unless `--liquidate` is passed.
+
+**Synopsis:** `nexus strategy delete NAME [OPTIONS]`
+
+**Arguments:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `NAME` | str | yes | Strategy name |
+
+**Options:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--liquidate` | bool | `false` | Cancel open orders and market-sell all positions before deleting |
+| `--yes`, `-y` | bool | `false` | Skip confirmation prompt |
+
+**Example:**
+
+```bash
+nexus strategy delete old_strat --yes
+nexus strategy delete bad_strat --liquidate --yes
+```
+
+---
+
 ## Broker Commands
 
 Register and manage Alpaca CLI broker profiles. Nexus delegates authentication to the Alpaca CLI; no API keys are stored by Nexus.

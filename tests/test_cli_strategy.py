@@ -1,9 +1,9 @@
-"""Tests for strategy CLI commands: show, deposit, withdraw, set-broker."""
+"""Tests for strategy CLI commands: show, deposit, withdraw, set-broker, delete."""
 from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from typer.testing import CliRunner
@@ -129,3 +129,117 @@ class TestStrategySetBroker:
         result = _invoke(conn, ["strategy", "set-broker", "test_strat", "--broker", "paper2"])
         assert result.exit_code != 0
         assert "open" in result.output.lower() or "open" in (result.stderr or "").lower()
+
+
+class TestStrategyDelete:
+    def test_delete_clean_strategy(self):
+        conn = _setup_test_db()
+        result = _invoke(conn, ["strategy", "delete", "test_strat", "--yes"])
+        assert result.exit_code == 0
+        assert "deleted" in result.output.lower()
+        row = conn.execute("SELECT * FROM strategies WHERE name = 'test_strat'").fetchone()
+        assert row is None
+
+    def test_delete_nonexistent_strategy(self):
+        conn = _setup_test_db()
+        result = _invoke(conn, ["strategy", "delete", "ghost", "--yes"])
+        assert result.exit_code != 0
+
+    def test_delete_blocks_with_open_orders(self):
+        conn = _setup_test_db()
+        conn.execute(
+            "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status, broker_order_id)"
+            " VALUES (1, 'AAPL', 'buy', 10, 'market', 'submitted', 'broker-123')"
+        )
+        conn.commit()
+        result = _invoke(conn, ["strategy", "delete", "test_strat", "--yes"])
+        assert result.exit_code != 0
+        assert "open order" in result.output.lower() or "open order" in (result.stderr or "").lower()
+
+    def test_delete_blocks_with_positions(self):
+        conn = _setup_test_db()
+        conn.execute(
+            "INSERT INTO positions (strategy_id, symbol, qty, reserved_qty, avg_entry_price)"
+            " VALUES (1, 'AAPL', 10, 0, 150.0)"
+        )
+        conn.commit()
+        result = _invoke(conn, ["strategy", "delete", "test_strat", "--yes"])
+        assert result.exit_code != 0
+        assert "open position" in result.output.lower() or "open position" in (result.stderr or "").lower()
+
+    def test_delete_removes_related_records(self):
+        conn = _setup_test_db()
+        # Add some history (filled order, transaction, position with qty=0)
+        conn.execute(
+            "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status)"
+            " VALUES (1, 'AAPL', 'buy', 10, 'market', 'filled')"
+        )
+        conn.execute(
+            "INSERT INTO transactions (strategy_id, order_id, type, amount, actor)"
+            " VALUES (1, 1, 'fill', 1500.0, 'cli:manual')"
+        )
+        conn.execute(
+            "INSERT INTO positions (strategy_id, symbol, qty, reserved_qty)"
+            " VALUES (1, 'AAPL', 0, 0)"
+        )
+        conn.commit()
+        result = _invoke(conn, ["strategy", "delete", "test_strat", "--yes"])
+        assert result.exit_code == 0
+        assert conn.execute("SELECT * FROM orders WHERE strategy_id = 1").fetchone() is None
+        assert conn.execute("SELECT * FROM transactions WHERE strategy_id = 1").fetchone() is None
+        assert conn.execute("SELECT * FROM positions WHERE strategy_id = 1").fetchone() is None
+
+    def test_delete_liquidate_cancels_and_sells(self):
+        conn = _setup_test_db()
+        conn.execute(
+            "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status, broker_order_id)"
+            " VALUES (1, 'AAPL', 'buy', 10, 'market', 'submitted', 'broker-123')"
+        )
+        conn.execute(
+            "INSERT INTO positions (strategy_id, symbol, qty, reserved_qty, avg_entry_price)"
+            " VALUES (1, 'TSLA', 5, 0, 200.0)"
+        )
+        conn.commit()
+
+        mock_broker = MagicMock()
+        mock_broker.cancel_order.return_value = None
+        mock_submit_result = MagicMock()
+        mock_submit_result.broker_order_id = "broker-sell-456"
+        mock_broker.submit_order.return_value = mock_submit_result
+
+        def clear_position(c, sid, b):
+            c.execute("UPDATE positions SET qty = 0 WHERE strategy_id = ?", (sid,))
+            c.commit()
+
+        with patch("nexus.cli.strategy.get_connection", return_value=conn), \
+             patch("nexus.cli.strategy.init_db"), \
+             patch("nexus.broker.AlpacaBroker", return_value=mock_broker), \
+             patch("nexus.sync.sync_outstanding_orders", side_effect=clear_position):
+            result = runner.invoke(app, ["strategy", "delete", "test_strat", "--liquidate", "--yes"])
+
+        assert result.exit_code == 0, result.output
+        assert "liquidated" in result.output.lower() or "deleted" in result.output.lower()
+        assert conn.execute("SELECT * FROM strategies WHERE name = 'test_strat'").fetchone() is None
+        mock_broker.cancel_order.assert_called_once_with("broker-123")
+        mock_broker.submit_order.assert_called_once()
+
+    def test_delete_liquidate_broker_error_aborts(self):
+        conn = _setup_test_db()
+        conn.execute(
+            "INSERT INTO positions (strategy_id, symbol, qty, reserved_qty, avg_entry_price)"
+            " VALUES (1, 'AAPL', 10, 0, 150.0)"
+        )
+        conn.commit()
+
+        mock_broker = MagicMock()
+        mock_broker.submit_order.side_effect = RuntimeError("connection failed")
+
+        with patch("nexus.cli.strategy.get_connection", return_value=conn), \
+             patch("nexus.cli.strategy.init_db"), \
+             patch("nexus.broker.AlpacaBroker", return_value=mock_broker):
+            result = runner.invoke(app, ["strategy", "delete", "test_strat", "--liquidate", "--yes"])
+
+        assert result.exit_code != 0
+        assert "broker error" in result.output.lower() or "broker error" in (result.stderr or "").lower()
+        # Strategy should NOT be deleted
+        assert conn.execute("SELECT * FROM strategies WHERE name = 'test_strat'").fetchone() is not None

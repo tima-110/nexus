@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from uuid import uuid4
 
 import typer
 
 from nexus.cli import json_output
 from nexus.db import get_connection, init_db
-from nexus.ledger import record_transaction
+from nexus.ledger import process_cancel, record_transaction
 
 strategy_app = typer.Typer(name="strategy", no_args_is_help=True)
 
@@ -289,3 +290,183 @@ def strategy_set_broker(
     if json_output({"status": "ok", "message": msg}):
         return
     typer.echo(msg)
+
+
+@strategy_app.command("delete")
+def strategy_delete(
+    name: str = typer.Argument(..., help="Strategy name"),
+    liquidate: bool = typer.Option(False, "--liquidate", help="Cancel open orders and market-sell all positions before deleting"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Delete a strategy and all its history."""
+    conn = get_connection()
+    init_db(conn)
+
+    row = conn.execute(
+        "SELECT s.id, s.name, b.profile_name AS broker_profile"
+        " FROM strategies s"
+        " JOIN broker_accounts b ON s.broker_account_id = b.id"
+        " WHERE s.name = ?",
+        (name,),
+    ).fetchone()
+    if row is None:
+        json_output({"error": f"strategy '{name}' not found"})
+        typer.echo(f"Error: strategy '{name}' not found.", err=True)
+        raise typer.Exit(1)
+
+    strategy_id = row["id"]
+    broker_profile = row["broker_profile"]
+
+    open_orders = conn.execute(
+        "SELECT id, broker_order_id FROM orders"
+        " WHERE strategy_id = ? AND status IN ('submitted', 'partially_filled')",
+        (strategy_id,),
+    ).fetchall()
+
+    positions = conn.execute(
+        "SELECT symbol, qty, reserved_qty FROM positions WHERE strategy_id = ? AND qty > 0",
+        (strategy_id,),
+    ).fetchall()
+
+    if not liquidate:
+        if open_orders:
+            msg = f"Cannot delete: strategy has {len(open_orders)} open order(s). Use --liquidate to force."
+            json_output({"error": msg})
+            typer.echo(f"Error: {msg}", err=True)
+            raise typer.Exit(1)
+        if positions:
+            msg = f"Cannot delete: strategy has {len(positions)} open position(s). Use --liquidate to force."
+            json_output({"error": msg})
+            typer.echo(f"Error: {msg}", err=True)
+            raise typer.Exit(1)
+
+        if not yes:
+            typer.confirm(
+                f"Delete strategy '{name}'? This removes all history.",
+                abort=True,
+            )
+
+        _purge_strategy(conn, strategy_id)
+        msg = f"Strategy '{name}' deleted."
+        if json_output({"status": "ok", "message": msg}):
+            return
+        typer.echo(msg)
+        return
+
+    # --liquidate path
+    if not yes:
+        parts = []
+        if open_orders:
+            parts.append(f"cancel {len(open_orders)} open order(s)")
+        if positions:
+            parts.append(f"market-sell {len(positions)} position(s)")
+        action = " and ".join(parts) if parts else "delete"
+        typer.confirm(
+            f"This will {action} for strategy '{name}', then delete it. Proceed?",
+            abort=True,
+        )
+
+    from nexus.broker import AlpacaBroker
+    from nexus.sync import sync_outstanding_orders
+
+    broker = AlpacaBroker(broker_profile)
+    cancelled_count = 0
+    closed_symbols: list[str] = []
+
+    # Cancel open orders
+    for order in open_orders:
+        try:
+            broker.cancel_order(order["broker_order_id"])
+        except RuntimeError:
+            pass
+        process_cancel(conn, order["id"])
+        cancelled_count += 1
+    conn.commit()
+
+    # Market sell each position
+    for pos in positions:
+        symbol = pos["symbol"]
+        available = pos["qty"] - (pos["reserved_qty"] or 0)
+        if available <= 0:
+            continue
+
+        client_order_id = f"nx-{name[:6]}-{symbol}-{uuid4().hex[:8]}"
+        now = datetime.now(timezone.utc).isoformat()
+
+        cur = conn.execute(
+            "INSERT INTO orders"
+            " (strategy_id, symbol, side, qty, order_type,"
+            "  status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+            " VALUES (?, ?, 'sell', ?, 'market', 'pending', ?, ?, 0, 'cli:liquidate', ?, ?)",
+            (strategy_id, symbol, available, client_order_id, float(available), now, now),
+        )
+        order_id = cur.lastrowid
+
+        from nexus.ledger import reserve_shares
+        reserve_shares(conn, strategy_id, symbol, available)
+        conn.commit()
+
+        try:
+            result = broker.submit_order(symbol, available, "sell", "market", client_order_id=client_order_id)
+            conn.execute(
+                "UPDATE orders SET status = 'submitted', broker_order_id = ?, updated_at = ? WHERE id = ?",
+                (result.broker_order_id, datetime.now(timezone.utc).isoformat(), order_id),
+            )
+            conn.commit()
+            closed_symbols.append(symbol)
+        except RuntimeError as exc:
+            conn.execute(
+                "UPDATE orders SET status = 'cancelled', updated_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), order_id),
+            )
+            from nexus.ledger import release_shares
+            release_shares(conn, strategy_id, symbol, available)
+            conn.commit()
+            msg = f"Broker error selling {symbol}: {exc}. Strategy not deleted."
+            json_output({"error": msg})
+            typer.echo(f"Error: {msg}", err=True)
+            raise typer.Exit(1)
+
+    # Sync to pick up fills
+    if closed_symbols:
+        sync_outstanding_orders(conn, strategy_id, broker)
+
+    # Verify all positions are flat
+    remaining = conn.execute(
+        "SELECT symbol, qty FROM positions WHERE strategy_id = ? AND qty > 0",
+        (strategy_id,),
+    ).fetchall()
+    if remaining:
+        symbols = [r["symbol"] for r in remaining]
+        msg = f"Positions not fully closed: {', '.join(symbols)}. Retry or close manually."
+        json_output({"error": msg})
+        typer.echo(f"Error: {msg}", err=True)
+        raise typer.Exit(1)
+
+    _purge_strategy(conn, strategy_id)
+
+    result_data = {
+        "status": "ok",
+        "message": f"Strategy '{name}' liquidated and deleted.",
+        "liquidated": {
+            "cancelled_orders": cancelled_count,
+            "closed_positions": closed_symbols,
+        },
+    }
+    if json_output(result_data):
+        return
+    typer.echo(f"Strategy '{name}' liquidated and deleted.")
+    if cancelled_count:
+        typer.echo(f"  Cancelled orders: {cancelled_count}")
+    if closed_symbols:
+        typer.echo(f"  Closed positions: {', '.join(closed_symbols)}")
+
+
+def _purge_strategy(conn, strategy_id: int) -> None:
+    """Delete a strategy and all dependent rows."""
+    conn.execute("DELETE FROM reservations WHERE strategy_id = ?", (strategy_id,))
+    conn.execute("DELETE FROM transactions WHERE strategy_id = ?", (strategy_id,))
+    conn.execute("DELETE FROM orders WHERE strategy_id = ?", (strategy_id,))
+    conn.execute("DELETE FROM positions WHERE strategy_id = ?", (strategy_id,))
+    conn.execute("DELETE FROM strategies WHERE id = ?", (strategy_id,))
+    conn.commit()
