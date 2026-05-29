@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import typer
 
+from nexus.broker import AlpacaBroker
 from nexus.cli import json_output
 from nexus.db import get_connection, init_db
 from nexus.ledger import process_cancel, record_transaction
@@ -114,15 +115,30 @@ def strategy_show(name: str = typer.Argument(..., help="Strategy name")) -> None
         (strategy_id,),
     ).fetchall()
 
-    position_value = sum(p["qty"] * (p["avg_entry_price"] or 0.0) for p in positions)
     cash_balance = row["cash_balance"] or 0.0
-    total_value = cash_balance + position_value
+
+    broker = AlpacaBroker(row["broker"])
+    live_prices: dict[str, float] = {}
+    try:
+        broker_positions = broker.get_positions()
+        live_prices = {p.symbol: float(p.current_price) for p in broker_positions}
+    except RuntimeError:
+        pass
+
+    positions_market_value = sum(
+        p["qty"] * live_prices.get(p["symbol"], p["avg_entry_price"] or 0.0)
+        for p in positions
+    )
+    total_equity = cash_balance + positions_market_value
 
     if json_output({
         "name": row["name"],
         "cash_balance": cash_balance,
         "broker_profile": row["broker"],
         "is_active": bool(row["is_active"]),
+        "positions_market_value": positions_market_value,
+        "total_equity": total_equity,
+        "prices_are_live": bool(live_prices),
         "positions": [
             {"symbol": p["symbol"], "qty": p["qty"], "reserved_qty": p["reserved_qty"] or 0, "avg_entry_price": p["avg_entry_price"]}
             for p in positions
@@ -139,8 +155,8 @@ def strategy_show(name: str = typer.Argument(..., help="Strategy name")) -> None
     typer.echo(f"Broker:         {row['broker']}")
     typer.echo(f"Active:         {active}")
     typer.echo(f"Cash balance:   ${cash_balance:.2f}")
-    typer.echo(f"Position value: ${position_value:.2f}")
-    typer.echo(f"Total value:    ${total_value:.2f}")
+    typer.echo(f"Position value: ${positions_market_value:.2f}{'  (live)' if live_prices else '  (cost basis)'}")
+    typer.echo(f"Total equity:   ${total_equity:.2f}")
 
     if positions:
         typer.echo("")

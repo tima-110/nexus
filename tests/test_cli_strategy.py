@@ -1,8 +1,10 @@
 """Tests for strategy CLI commands: show, deposit, withdraw, set-broker, delete."""
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -94,6 +96,55 @@ class TestStrategyShow:
         conn = _setup_test_db()
         result = _invoke(conn, ["strategy", "show", "ghost"])
         assert result.exit_code != 0
+
+    def _insert_position(self, conn, strategy_id=1, symbol="AAPL", qty=10, avg_entry=150.0):
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO positions (strategy_id, symbol, qty, reserved_qty, avg_entry_price,"
+            " opened_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)",
+            (strategy_id, symbol, qty, avg_entry, now, now),
+        )
+        conn.commit()
+
+    def test_show_json_equity_with_live_prices(self):
+        """JSON output includes positions_market_value and total_equity using live prices."""
+        conn = _setup_test_db()
+        self._insert_position(conn, qty=10, avg_entry=150.0)
+
+        mock_broker_cls = MagicMock()
+        mock_broker = MagicMock()
+        mock_broker_cls.return_value = mock_broker
+        mock_broker.get_positions.return_value = [
+            MagicMock(symbol="AAPL", current_price=Decimal("175.00")),
+        ]
+
+        with patch("nexus.cli.strategy.AlpacaBroker", mock_broker_cls):
+            result = _invoke(conn, ["--json", "strategy", "show", "test_strat"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["positions_market_value"] == pytest.approx(1750.0)   # 10 * 175
+        assert data["total_equity"] == pytest.approx(11750.0)             # 10000 + 1750
+        assert data["prices_are_live"] is True
+
+    def test_show_json_equity_falls_back_to_cost_basis(self):
+        """When broker is unreachable, equity uses avg_entry_price and prices_are_live is false."""
+        conn = _setup_test_db()
+        self._insert_position(conn, qty=10, avg_entry=150.0)
+
+        mock_broker_cls = MagicMock()
+        mock_broker = MagicMock()
+        mock_broker_cls.return_value = mock_broker
+        mock_broker.get_positions.side_effect = RuntimeError("timeout")
+
+        with patch("nexus.cli.strategy.AlpacaBroker", mock_broker_cls):
+            result = _invoke(conn, ["--json", "strategy", "show", "test_strat"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["positions_market_value"] == pytest.approx(1500.0)   # 10 * 150 (cost basis)
+        assert data["total_equity"] == pytest.approx(11500.0)
+        assert data["prices_are_live"] is False
 
 
 class TestStrategySetBroker:
