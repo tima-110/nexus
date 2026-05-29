@@ -65,14 +65,15 @@ nexus --json order buy AAPL 10 --strategy my_strat
 
 | Command | Purpose | Output Shape |
 |---------|---------|--------------|
-| `nexus --json strategy show <name>` | Check balance and positions | Single entity |
+| `nexus --json strategy show <name>` | Check balance, equity, and positions | Single entity |
 | `nexus --json order buy <symbol> <qty> --strategy <name>` | Buy shares | Confirmation |
 | `nexus --json order sell <symbol> <qty> --strategy <name>` | Sell shares | Confirmation |
 | `nexus --json order close <symbol> --strategy <name>` | Close entire position | Confirmation |
 | `nexus --json order status <id>` | Check one order | Single entity |
 | `nexus --json order list --strategy <name>` | List orders | List |
-| `nexus --json order list --strategy <name> --status open` | List open orders | List |
-| `nexus --json position list --strategy <name>` | List positions | List |
+| `nexus --json order list --strategy <name> --status submitted` | List open orders | List |
+| `nexus --json order list --strategy <name> --type stop --side sell` | List stop-sell orders | List |
+| `nexus --json position list --strategy <name>` | List positions with avg_entry_price | List |
 | `nexus --json position show <strategy> <symbol>` | Show one position | Single entity |
 | `nexus --json strategy delete <name> --yes` | Delete a strategy | Confirmation |
 | `nexus --json strategy delete <name> --liquidate --yes` | Liquidate and delete | Confirmation |
@@ -83,9 +84,10 @@ nexus --json order buy AAPL 10 --strategy my_strat
 ## Workflow: Opening a Position
 
 ```bash
-# 1. Check available balance
+# 1. Check available balance and total equity
 nexus --json strategy show my_strat
-# Look at: cash_balance, margin_multiplier, active reservations
+# Look at: cash_balance, total_equity, positions_market_value, prices_are_live
+# total_equity = cash_balance + positions_market_value (live price when available)
 # Buying power = (cash_balance - active_reservations) x margin_multiplier
 
 # 2. Place buy order
@@ -176,6 +178,19 @@ You do not need to poll aggressively. Eager sync ensures that the next command y
 | stop_limit | `--stop-price 140.00 --limit-price 139.50` | Becomes limit order when stop price is hit |
 | trailing_stop | `--trail-percent 2.0` | Stop price trails market by percentage |
 
+### Time in Force
+
+Use `--time-in-force` on `order buy` and `order sell` to control order duration:
+
+| Value | Behavior |
+|-------|----------|
+| `day` | Expires at market close (Alpaca default when omitted) |
+| `gtc` | Good-till-cancelled — survives overnight and weekends |
+| `ioc` | Immediate-or-cancel |
+| `fok` | Fill-or-kill |
+
+**Stop-loss orders should use `--time-in-force gtc`** to remain active overnight. Day-only stops expire at 4 PM, creating a gap in protection.
+
 Example — limit buy:
 ```bash
 nexus --json order buy AAPL 10 --strategy my_strat --limit-price 150.00 --actor "agent:my-agent"
@@ -186,15 +201,32 @@ Example — trailing stop sell:
 nexus --json order sell AAPL 10 --strategy my_strat --trail-percent 2.0 --actor "agent:my-agent"
 ```
 
+Example — GTC stop-loss:
+```bash
+nexus --json order sell AAPL 10 --strategy my_strat --type stop --stop-price 140.00 --time-in-force gtc --actor "agent:my-agent"
+```
+
+### Filtering Orders by Type
+
+Use `--type` and `--side` on `order list` to query specific order categories without client-side filtering:
+
+```bash
+# Audit all active stop-loss orders
+nexus --json order list --strategy my_strat --type stop --side sell
+
+# Check for GTC orders
+nexus --json order list --strategy my_strat --status submitted
+```
+
 ---
 
 ## Best Practices
 
 1. **Always pass `--actor "agent:<your-name>"`** — this is how your orders are identified in audit logs and history.
 
-2. **Check strategy balance before placing orders** — call `strategy show` and verify buying power covers the intended order.
+2. **Check strategy balance before placing orders** — call `strategy show` and verify buying power covers the intended order. Use `total_equity` (not `cash_balance` alone) for accurate portfolio value when positions are held. Check `prices_are_live` to know whether the equity figure is based on live or cost-basis prices.
 
-3. **Use `order list --status open` to track pending orders** — do not assume immediate fills for limit/stop orders.
+3. **Use `order list --status submitted` to track pending orders** — do not assume immediate fills for limit/stop orders.
 
 4. **Do not poll in tight loops** — eager sync handles state freshness on each command invocation. If you need to check status, a single call is sufficient.
 
@@ -205,3 +237,9 @@ nexus --json order sell AAPL 10 --strategy my_strat --trail-percent 2.0 --actor 
 7. **Parse JSON output programmatically** — always check for the `error` key first. If present, the operation failed regardless of other fields.
 
 8. **Respect market hours** — market orders placed outside trading hours may be queued or rejected depending on broker configuration.
+
+9. **Use `--time-in-force gtc` for stop-loss orders** — day-only stops expire at market close. GTC stops remain active overnight and over weekends, providing continuous protection.
+
+10. **Use `order list --type stop --side sell` to audit stop-losses** — server-side filtering is cheaper than fetching all orders and filtering in Python. The `time_in_force` field in each item confirms whether the stop is GTC.
+
+11. **Run `nexus reconcile` to populate `avg_entry_price`** — positions entered before Nexus started tracking them will have `null` for `avg_entry_price` until the first reconcile sweep bootstraps it from the broker.

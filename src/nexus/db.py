@@ -53,6 +53,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             limit_price         REAL,
             stop_price          REAL,
             trail_percent       REAL,
+            time_in_force       TEXT,
             status              TEXT    NOT NULL,
             client_order_id     TEXT    UNIQUE,
             broker_order_id     TEXT,
@@ -98,3 +99,10 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     conn.commit()
+
+    # Migration: add time_in_force to existing orders tables
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN time_in_force TEXT")
+        conn.commit()
+    except Exception:
+        pass  # column already exists

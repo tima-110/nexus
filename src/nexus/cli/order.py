@@ -54,6 +54,7 @@ def order_buy(
     limit_price: float | None = typer.Option(None, "--limit-price"),
     stop_price: float | None = typer.Option(None, "--stop-price"),
     trail_percent: float | None = typer.Option(None, "--trail-percent"),
+    time_in_force: str | None = typer.Option(None, "--time-in-force", help="Time in force (day, gtc, ioc, fok)"),
     actor: str = typer.Option("cli:manual", "--actor"),
 ) -> None:
     """Place a buy order."""
@@ -101,11 +102,11 @@ def order_buy(
     cur = conn.execute(
         "INSERT INTO orders"
         " (strategy_id, symbol, side, qty, order_type, limit_price, stop_price, trail_percent,"
-        "  status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
-        " VALUES (?, ?, 'buy', ?, ?, ?, ?, ?, 'pending', ?, ?, 0, ?, ?, ?)",
+        "  time_in_force, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+        " VALUES (?, ?, 'buy', ?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, ?, ?, ?)",
         (
             strategy_id, symbol, qty, order_type,
-            limit_price, stop_price, trail_percent,
+            limit_price, stop_price, trail_percent, time_in_force,
             client_order_id, estimated_cost,
             actor, now, now,
         ),
@@ -124,6 +125,7 @@ def order_buy(
             limit_price=limit_price,
             stop_price=stop_price,
             trail_percent=trail_percent,
+            time_in_force=time_in_force,
         )
     except RuntimeError as exc:
         # Roll back: cancel order + release reservation
@@ -151,6 +153,7 @@ def order_buy(
         "symbol": symbol,
         "qty": qty,
         "order_type": order_type,
+        "time_in_force": time_in_force,
         "client_order_id": client_order_id,
         "broker_order_id": result.broker_order_id,
         "estimated_cost": estimated_cost,
@@ -171,6 +174,7 @@ def order_sell(
     limit_price: float | None = typer.Option(None, "--limit-price"),
     stop_price: float | None = typer.Option(None, "--stop-price"),
     trail_percent: float | None = typer.Option(None, "--trail-percent"),
+    time_in_force: str | None = typer.Option(None, "--time-in-force", help="Time in force (day, gtc, ioc, fok)"),
     actor: str = typer.Option("cli:manual", "--actor"),
 ) -> None:
     """Place a sell order."""
@@ -202,11 +206,11 @@ def order_sell(
     cur = conn.execute(
         "INSERT INTO orders"
         " (strategy_id, symbol, side, qty, order_type, limit_price, stop_price, trail_percent,"
-        "  status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
-        " VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, 'pending', ?, ?, 0, ?, ?, ?)",
+        "  time_in_force, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+        " VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, ?, ?, ?)",
         (
             strategy_id, symbol, qty, order_type,
-            limit_price, stop_price, trail_percent,
+            limit_price, stop_price, trail_percent, time_in_force,
             client_order_id, float(qty),
             actor, now, now,
         ),
@@ -225,6 +229,7 @@ def order_sell(
             limit_price=limit_price,
             stop_price=stop_price,
             trail_percent=trail_percent,
+            time_in_force=time_in_force,
         )
     except RuntimeError as exc:
         # Roll back: cancel order + release shares
@@ -252,6 +257,7 @@ def order_sell(
         "symbol": symbol,
         "qty": qty,
         "order_type": order_type,
+        "time_in_force": time_in_force,
         "client_order_id": client_order_id,
         "broker_order_id": result.broker_order_id,
         "actor": actor,
@@ -536,7 +542,7 @@ def order_list(
 
     query = (
         "SELECT o.id, s.name AS strategy, o.symbol, o.side, o.qty, o.order_type,"
-        "       o.status, o.client_order_id, o.filled_qty, o.created_at"
+        "       o.time_in_force, o.status, o.client_order_id, o.filled_qty, o.created_at"
         " FROM orders o"
         " JOIN strategies s ON o.strategy_id = s.id"
         " WHERE 1=1"

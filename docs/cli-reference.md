@@ -1,6 +1,6 @@
 # Nexus CLI Reference
 
-Complete reference for all `nexus` commands. Version 0.1.0.
+Complete reference for all `nexus` commands. Version 0.2.2.
 
 ---
 
@@ -47,6 +47,7 @@ Place a buy order.
 | `--limit-price` | float | None | Limit price |
 | `--stop-price` | float | None | Stop price |
 | `--trail-percent` | float | None | Trailing stop percent |
+| `--time-in-force` | str | None | Time in force (day, gtc, ioc, fok) |
 | `--actor` | str | `cli:manual` | Actor identifier for audit trail |
 
 **Example:**
@@ -54,6 +55,7 @@ Place a buy order.
 ```bash
 nexus order buy AAPL 10 --strategy momentum --type limit --limit-price 175.00
 nexus --json order buy TSLA 5 --strategy growth
+nexus --json order buy AAPL 10 --strategy momentum --type limit --limit-price 175.00 --time-in-force gtc
 ```
 
 ---
@@ -80,6 +82,7 @@ Place a sell order.
 | `--limit-price` | float | None | Limit price |
 | `--stop-price` | float | None | Stop price |
 | `--trail-percent` | float | None | Trailing stop percent |
+| `--time-in-force` | str | None | Time in force (day, gtc, ioc, fok) |
 | `--actor` | str | `cli:manual` | Actor identifier for audit trail |
 
 **Example:**
@@ -87,6 +90,7 @@ Place a sell order.
 ```bash
 nexus order sell AAPL 10 --strategy momentum
 nexus order sell TSLA 5 --strategy growth --type limit --limit-price 250.00
+nexus --json order sell AAPL 10 --strategy momentum --type stop --stop-price 140.00 --time-in-force gtc
 ```
 
 ---
@@ -203,6 +207,8 @@ List orders with optional filters.
 | `--strategy` | str | None | Filter by strategy name |
 | `--status` | str | None | Filter by order status |
 | `--symbol` | str | None | Filter by ticker symbol |
+| `--type` | str | None | Filter by order type (market, limit, stop, stop_limit, trailing_stop) |
+| `--side` | str | None | Filter by side (buy, sell) |
 
 **Example:**
 
@@ -210,6 +216,7 @@ List orders with optional filters.
 nexus order list
 nexus order list --strategy momentum --status submitted
 nexus --json order list --symbol AAPL
+nexus --json order list --strategy momentum --type stop --side sell
 ```
 
 ---
@@ -271,6 +278,12 @@ Show details for a strategy including positions and open orders.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `NAME` | str | yes | Strategy name |
+
+**JSON fields:** `name`, `cash_balance`, `broker_profile`, `is_active`, `positions_market_value`, `total_equity`, `prices_are_live`, `positions`, `open_orders`
+
+- `positions_market_value` — current market value of all open positions (live price × qty)
+- `total_equity` — `cash_balance + positions_market_value`
+- `prices_are_live` — `true` if live broker prices were used; `false` if falling back to cost basis (broker unreachable)
 
 **Example:**
 
@@ -511,6 +524,10 @@ List open positions across all strategies (or a single strategy).
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--strategy` | str | None | Filter by strategy |
+
+**JSON fields per item:** `strategy`, `symbol`, `qty`, `reserved_qty`, `available`, `avg_entry_price`
+
+`avg_entry_price` is `null` for positions not yet reconciled with the broker. Run `nexus reconcile` to populate it.
 
 **Example:**
 

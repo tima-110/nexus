@@ -65,6 +65,8 @@ class AlpacaBroker:
             args += ["--stop-price", str(params["stop_price"])]
         if params.get("trail_percent") is not None:
             args += ["--trail-percent", str(params["trail_percent"])]
+        if params.get("time_in_force") is not None:
+            args += ["--time-in-force", params["time_in_force"]]
         data = self._run(*args)
         return self._order_from_dict(data)
 
