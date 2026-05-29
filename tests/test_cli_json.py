@@ -105,6 +105,104 @@ class TestJsonOrderList:
         assert data["items"][0]["symbol"] == "AAPL"
         assert data["items"][0]["side"] == "buy"
 
+    @patch("nexus.cli.order.get_connection")
+    def test_json_order_list_type_filter(self, mock_conn):
+        """--type filters orders by order_type."""
+        conn = _get_test_conn()
+        conn.execute(
+            "INSERT INTO strategies (name, broker_account_id, cash_balance, is_active, created_at)"
+            " VALUES (?, ?, ?, 1, '2026-01-01T00:00:00Z')",
+            ("test_strat", 1, 10000.0),
+        )
+        conn.execute(
+            "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status,"
+            " client_order_id, filled_qty, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, "AAPL", "sell", 10, "stop", "submitted",
+             "nx-test-AAPL-stop", 0, "2026-01-01T10:00:00Z", "2026-01-01T10:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status,"
+            " client_order_id, filled_qty, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, "AAPL", "buy", 5, "market", "submitted",
+             "nx-test-AAPL-mkt", 0, "2026-01-01T11:00:00Z", "2026-01-01T11:00:00Z"),
+        )
+        conn.commit()
+        mock_conn.return_value = conn
+
+        result = runner.invoke(app, ["--json", "order", "list", "--strategy", "test_strat", "--type", "stop"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert len(data["items"]) == 1
+        assert data["items"][0]["order_type"] == "stop"
+
+    @patch("nexus.cli.order.get_connection")
+    def test_json_order_list_side_filter(self, mock_conn):
+        """--side filters orders by side."""
+        conn = _get_test_conn()
+        conn.execute(
+            "INSERT INTO strategies (name, broker_account_id, cash_balance, is_active, created_at)"
+            " VALUES (?, ?, ?, 1, '2026-01-01T00:00:00Z')",
+            ("test_strat", 1, 10000.0),
+        )
+        conn.execute(
+            "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status,"
+            " client_order_id, filled_qty, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, "AAPL", "buy", 10, "market", "submitted",
+             "nx-test-AAPL-buy", 0, "2026-01-01T10:00:00Z", "2026-01-01T10:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status,"
+            " client_order_id, filled_qty, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, "AAPL", "sell", 10, "stop", "submitted",
+             "nx-test-AAPL-sell", 0, "2026-01-01T11:00:00Z", "2026-01-01T11:00:00Z"),
+        )
+        conn.commit()
+        mock_conn.return_value = conn
+
+        result = runner.invoke(app, ["--json", "order", "list", "--strategy", "test_strat", "--side", "sell"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert len(data["items"]) == 1
+        assert data["items"][0]["side"] == "sell"
+
+    @patch("nexus.cli.order.get_connection")
+    def test_json_order_list_type_and_side_filter(self, mock_conn):
+        """--type and --side together filter by both dimensions."""
+        conn = _get_test_conn()
+        conn.execute(
+            "INSERT INTO strategies (name, broker_account_id, cash_balance, is_active, created_at)"
+            " VALUES (?, ?, ?, 1, '2026-01-01T00:00:00Z')",
+            ("test_strat", 1, 10000.0),
+        )
+        for cid, side, order_type in [
+            ("nx-1", "sell", "stop"),
+            ("nx-2", "buy", "stop"),
+            ("nx-3", "sell", "market"),
+        ]:
+            conn.execute(
+                "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status,"
+                " client_order_id, filled_qty, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (1, "AAPL", side, 10, order_type, "submitted",
+                 cid, 0, "2026-01-01T10:00:00Z", "2026-01-01T10:00:00Z"),
+            )
+        conn.commit()
+        mock_conn.return_value = conn
+
+        result = runner.invoke(app, ["--json", "order", "list", "--strategy", "test_strat", "--type", "stop", "--side", "sell"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert len(data["items"]) == 1
+        assert data["items"][0]["order_type"] == "stop"
+        assert data["items"][0]["side"] == "sell"
+
 
 class TestJsonReconcile:
     @patch("subprocess.run")

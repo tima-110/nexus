@@ -19,7 +19,7 @@ from nexus.ledger import (
     release_shares,
     reserve_shares,
 )
-from nexus.models import OrderStatus
+from nexus.models import OrderSide, OrderStatus, OrderType
 from nexus.sync import sync_outstanding_orders
 
 order_app = typer.Typer(name="order", no_args_is_help=True)
@@ -527,6 +527,8 @@ def order_list(
     strategy: str | None = typer.Option(None, "--strategy"),
     status: str | None = typer.Option(None, "--status"),
     symbol: str | None = typer.Option(None, "--symbol"),
+    order_type: OrderType | None = typer.Option(None, "--type", help="Filter by order type"),
+    side: OrderSide | None = typer.Option(None, "--side", help="Filter by side"),
 ) -> None:
     """List orders with optional filters."""
     conn = get_connection()
@@ -550,6 +552,12 @@ def order_list(
     if symbol is not None:
         query += " AND o.symbol = ?"
         params.append(symbol)
+    if order_type is not None:
+        query += " AND o.order_type = ?"
+        params.append(order_type)
+    if side is not None:
+        query += " AND o.side = ?"
+        params.append(side)
 
     query += " ORDER BY o.id DESC"
 

@@ -8,8 +8,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from decimal import Decimal
+
 from nexus.config import NexusConfig
-from nexus.reconciler import run_reconcile, ReconcileResult
+from nexus.reconciler import run_reconcile, ReconcileResult, _sync_position_prices
+from nexus.broker.types import BrokerPosition
 
 
 def _now() -> str:
@@ -259,3 +262,93 @@ class TestMarketHoursGate:
         ).fetchone()
         assert res is not None
         assert result.orphans_cleaned == 0
+
+
+class TestPositionPriceSync:
+    def _insert_position(self, conn, strategy_id, symbol, avg_entry_price=None):
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO positions (strategy_id, symbol, qty, reserved_qty, avg_entry_price,"
+            " opened_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (strategy_id, symbol, 10, 0, avg_entry_price, now, now),
+        )
+        conn.commit()
+
+    @patch("nexus.reconciler.AlpacaBroker")
+    def test_sync_populates_null_avg_entry_price(self, mock_broker_cls, conn, sample_strategy):
+        """_sync_position_prices fills avg_entry_price when it is NULL."""
+        self._insert_position(conn, sample_strategy, "AAPL", avg_entry_price=None)
+
+        mock_broker = MagicMock()
+        mock_broker_cls.return_value = mock_broker
+        mock_broker.get_positions.return_value = [
+            BrokerPosition(symbol="AAPL", qty=10, avg_entry_price=Decimal("150.00"),
+                           current_price=Decimal("155.00"), unrealized_pl=Decimal("50.00")),
+        ]
+
+        result = ReconcileResult()
+        _sync_position_prices(conn, result, dry_run=False)
+
+        row = conn.execute(
+            "SELECT avg_entry_price FROM positions WHERE strategy_id = ? AND symbol = ?",
+            (sample_strategy, "AAPL"),
+        ).fetchone()
+        assert row["avg_entry_price"] == pytest.approx(150.0)
+        assert result.positions_synced == 1
+
+    @patch("nexus.reconciler.AlpacaBroker")
+    def test_sync_does_not_overwrite_existing_avg_entry_price(self, mock_broker_cls, conn, sample_strategy):
+        """_sync_position_prices skips rows that already have avg_entry_price set."""
+        self._insert_position(conn, sample_strategy, "AAPL", avg_entry_price=140.0)
+
+        mock_broker = MagicMock()
+        mock_broker_cls.return_value = mock_broker
+        mock_broker.get_positions.return_value = [
+            BrokerPosition(symbol="AAPL", qty=10, avg_entry_price=Decimal("150.00"),
+                           current_price=Decimal("155.00"), unrealized_pl=Decimal("50.00")),
+        ]
+
+        result = ReconcileResult()
+        _sync_position_prices(conn, result, dry_run=False)
+
+        row = conn.execute(
+            "SELECT avg_entry_price FROM positions WHERE strategy_id = ? AND symbol = ?",
+            (sample_strategy, "AAPL"),
+        ).fetchone()
+        assert row["avg_entry_price"] == pytest.approx(140.0)  # unchanged
+        assert result.positions_synced == 0
+
+    @patch("nexus.reconciler.AlpacaBroker")
+    def test_sync_dry_run_does_not_modify(self, mock_broker_cls, conn, sample_strategy):
+        """_sync_position_prices dry_run skips the update."""
+        self._insert_position(conn, sample_strategy, "AAPL", avg_entry_price=None)
+
+        mock_broker = MagicMock()
+        mock_broker_cls.return_value = mock_broker
+        mock_broker.get_positions.return_value = [
+            BrokerPosition(symbol="AAPL", qty=10, avg_entry_price=Decimal("150.00"),
+                           current_price=Decimal("155.00"), unrealized_pl=Decimal("50.00")),
+        ]
+
+        result = ReconcileResult()
+        _sync_position_prices(conn, result, dry_run=True)
+
+        row = conn.execute(
+            "SELECT avg_entry_price FROM positions WHERE strategy_id = ? AND symbol = ?",
+            (sample_strategy, "AAPL"),
+        ).fetchone()
+        assert row["avg_entry_price"] is None  # unchanged
+        assert result.positions_synced == 0
+
+    @patch("nexus.reconciler.AlpacaBroker")
+    def test_sync_records_error_on_broker_failure(self, mock_broker_cls, conn, sample_strategy):
+        """_sync_position_prices records error without crashing when broker fails."""
+        mock_broker = MagicMock()
+        mock_broker_cls.return_value = mock_broker
+        mock_broker.get_positions.side_effect = RuntimeError("timeout")
+
+        result = ReconcileResult()
+        _sync_position_prices(conn, result, dry_run=False)
+
+        assert len(result.errors) == 1
+        assert "position_price_sync" in result.errors[0]

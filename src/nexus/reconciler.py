@@ -21,6 +21,7 @@ class ReconcileResult:
     bypass_orders: list[str] = field(default_factory=list)
     balance_drift: dict[str, float] = field(default_factory=dict)
     orphans_cleaned: int = 0
+    positions_synced: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -119,6 +120,34 @@ def _detect_bypass_orders(conn: sqlite3.Connection, result: ReconcileResult) -> 
             result.errors.append(f"bypass_detection({profile_name}): {e}")
 
 
+def _sync_position_prices(
+    conn: sqlite3.Connection, result: ReconcileResult, dry_run: bool
+) -> None:
+    """Step 3b: Sync avg_entry_price from broker for positions where it is NULL."""
+    rows = conn.execute(
+        "SELECT s.id AS strategy_id, ba.profile_name"
+        " FROM strategies s JOIN broker_accounts ba ON s.broker_account_id = ba.id"
+        " WHERE s.is_active = 1"
+    ).fetchall()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for row in rows:
+        try:
+            broker = AlpacaBroker(row["profile_name"])
+            positions = broker.get_positions()
+            for pos in positions:
+                if not dry_run:
+                    cur = conn.execute(
+                        "UPDATE positions SET avg_entry_price = ?, updated_at = ?"
+                        " WHERE strategy_id = ? AND symbol = ? AND avg_entry_price IS NULL",
+                        (float(pos.avg_entry_price), now_iso, row["strategy_id"], pos.symbol),
+                    )
+                    result.positions_synced += cur.rowcount
+            if not dry_run:
+                conn.commit()
+        except RuntimeError as e:
+            result.errors.append(f"position_price_sync({row['profile_name']}): {e}")
+
+
 def _cleanup_orphan_reservations(
     conn: sqlite3.Connection, result: ReconcileResult, dry_run: bool
 ) -> None:
@@ -173,6 +202,9 @@ def run_reconcile(
     # Step 3: Bypass detection (skip outside market hours if configured)
     if not outside_market:
         _detect_bypass_orders(conn, result)
+
+    # Step 3b: Sync NULL avg_entry_price from broker (always runs)
+    _sync_position_prices(conn, result, dry_run)
 
     # Step 4: Orphan cleanup (skip outside market hours if configured)
     if not outside_market:

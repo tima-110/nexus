@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
+import json
+
 import pytest
 from typer.testing import CliRunner
 
@@ -114,6 +116,21 @@ class TestPositionList:
         result = _invoke_list(conn, ["position", "list"])
         assert result.exit_code == 0
         assert "No open positions" in result.output
+
+    def test_list_json_null_avg_entry_price(self):
+        """--json position list returns null (not 0.0) when avg_entry_price is unknown."""
+        conn = _setup_test_db()
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO positions (strategy_id, symbol, qty, reserved_qty, avg_entry_price,"
+            " opened_at, updated_at) VALUES (1, 'AAPL', 5, 0, NULL, ?, ?)",
+            (now, now),
+        )
+        conn.commit()
+        result = _invoke_list(conn, ["--json", "position", "list"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["items"][0]["avg_entry_price"] is None
 
 
 class TestPositionShow:

@@ -39,7 +39,7 @@ def position_list(
             "strategy": r["strategy_name"], "symbol": r["symbol"],
             "qty": r["qty"] or 0, "reserved_qty": r["reserved_qty"] or 0,
             "available": (r["qty"] or 0) - (r["reserved_qty"] or 0),
-            "avg_entry_price": r["avg_entry_price"] or 0.0,
+            "avg_entry_price": r["avg_entry_price"],
         }
         for r in rows
     ]}):
@@ -103,8 +103,8 @@ def position_show(
     qty = position["qty"] or 0
     reserved = position["reserved_qty"] or 0
     available = qty - reserved
-    avg_entry = position["avg_entry_price"] or 0.0
-    cost_basis = qty * avg_entry
+    avg_entry = position["avg_entry_price"]
+    cost_basis = qty * (avg_entry or 0.0)
 
     live_price = None
     broker = AlpacaBroker(broker_profile)
@@ -123,7 +123,8 @@ def position_show(
     if json_output({
         "strategy": strategy, "symbol": symbol, "qty": qty,
         "reserved_qty": reserved, "available": available,
-        "avg_entry_price": avg_entry, "live_price": live_price,
+        "avg_entry_price": avg_entry,  # None when not yet known
+        "live_price": live_price,
         "open_orders": [
             {"id": o["id"], "side": o["side"], "qty": o["qty"], "order_type": o["order_type"], "status": o["status"]}
             for o in open_orders
@@ -136,7 +137,7 @@ def position_show(
     typer.echo(f"Quantity:    {qty}")
     typer.echo(f"Reserved:    {reserved}")
     typer.echo(f"Available:   {available}")
-    typer.echo(f"Avg entry:   ${avg_entry:.4f}")
+    typer.echo(f"Avg entry:   ${(avg_entry or 0.0):.4f}")
     typer.echo(f"Cost basis:  ${cost_basis:.2f}")
 
     if live_price is not None:
