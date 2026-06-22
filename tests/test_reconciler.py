@@ -4,15 +4,22 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from decimal import Decimal
 
+from nexus.broker.types import BrokerOrder, BrokerPosition
 from nexus.config import NexusConfig
-from nexus.reconciler import run_reconcile, ReconcileResult, _sync_position_prices
-from nexus.broker.types import BrokerPosition
+from nexus.reconciler import (
+    CANCEL_RETRY_LIMIT,
+    ReconcileResult,
+    _sync_cancellation_state,
+    _sync_position_prices,
+    run_reconcile,
+)
 
 
 def _now() -> str:
@@ -352,3 +359,266 @@ class TestPositionPriceSync:
 
         assert len(result.errors) == 1
         assert "position_price_sync" in result.errors[0]
+
+
+def _insert_cancel_state_order(
+    conn, strategy_id, broker_id, status, cancel_attempts=0
+):
+    """Helper: insert an order in a cancellation-related state with a broker id."""
+    cur = conn.execute(
+        "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status,"
+        " client_order_id, broker_order_id, cancel_attempts, actor, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            strategy_id,
+            "AAPL",
+            "buy",
+            10,
+            "market",
+            status,
+            f"nx-test-AAPL-{broker_id[:8]}",
+            broker_id,
+            cancel_attempts,
+            "test",
+            _now(),
+            _now(),
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+class TestCancellationSync:
+    @patch("nexus.reconciler.AlpacaBroker")
+    def test_ghost_order_re_cancelled(self, mock_broker_cls, conn, sample_strategy):
+        """Nexus='cancelled' + broker='open' → re-issue cancel; record ghost."""
+        order_id = _insert_cancel_state_order(
+            conn, sample_strategy, "broker-ghost-1", "cancelled"
+        )
+
+        mock_broker = MagicMock()
+        mock_broker_cls.return_value = mock_broker
+        mock_broker.list_orders.return_value = [
+            BrokerOrder(
+                broker_order_id="broker-ghost-1",
+                client_order_id="nx-test-AAPL-broker-g",
+                status="new",
+                symbol="AAPL",
+                side="buy",
+                qty=10,
+                filled_qty=0,
+                filled_avg_price=None,
+                submitted_at=_now(),
+                filled_at=None,
+            ),
+        ]
+        mock_broker.cancel_order.return_value = None
+
+        result = ReconcileResult()
+        audit_path = Path("/tmp/nexus-test-audit.jsonl")
+        audit_path.unlink(missing_ok=True)
+        _sync_cancellation_state(conn, result, dry_run=False, audit_path=audit_path)
+
+        # Ghost recorded, broker re-cancel called
+        assert len(result.ghosts_detected) == 1
+        assert result.ghosts_detected[0]["local_status"] == "cancelled"
+        assert result.ghosts_detected[0]["broker_open"] is True
+        assert result.ghosts_resolved == 1
+        mock_broker.cancel_order.assert_called_once_with("broker-ghost-1")
+
+        # Local status unchanged — we wait for the next sweep to confirm
+        row = conn.execute(
+            "SELECT status FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        assert row["status"] == "cancelled"
+
+    @patch("nexus.reconciler.AlpacaBroker")
+    def test_cancel_pending_resolved_when_broker_confirms(
+        self, mock_broker_cls, conn, sample_strategy
+    ):
+        """Nexus='cancel_pending' + broker='cancelled' → finalize via process_cancel."""
+        order_id = _insert_cancel_state_order(
+            conn, sample_strategy, "broker-pending-1", "cancel_pending"
+        )
+        # Add a reservation so we can verify it's released on finalize
+        conn.execute(
+            "INSERT INTO reservations (strategy_id, order_id, amount, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (sample_strategy, order_id, 1500.0, _now()),
+        )
+        conn.commit()
+
+        mock_broker = MagicMock()
+        mock_broker_cls.return_value = mock_broker
+        mock_broker.list_orders.return_value = []  # not in open set → must verify
+        mock_broker.get_order.return_value = BrokerOrder(
+            broker_order_id="broker-pending-1",
+            client_order_id="nx-test-AAPL-broker-p",
+            status="canceled",
+            symbol="AAPL",
+            side="buy",
+            qty=10,
+            filled_qty=0,
+            filled_avg_price=None,
+            submitted_at=_now(),
+            filled_at=None,
+        )
+
+        result = ReconcileResult()
+        audit_path = Path("/tmp/nexus-test-audit.jsonl")
+        audit_path.unlink(missing_ok=True)
+        _sync_cancellation_state(conn, result, dry_run=False, audit_path=audit_path)
+
+        row = conn.execute(
+            "SELECT status, cancel_attempts FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        assert row["status"] == "cancelled"
+        assert row["cancel_attempts"] == 0
+        # Reservation released
+        assert conn.execute(
+            "SELECT * FROM reservations WHERE order_id = ?", (order_id,)
+        ).fetchone() is None
+        assert result.ghosts_resolved == 1
+
+    @patch("nexus.reconciler.AlpacaBroker")
+    def test_cancel_failed_skipped(self, mock_broker_cls, conn, sample_strategy):
+        """Nexus='cancel_failed' → no broker call, just recorded as skipped."""
+        _insert_cancel_state_order(
+            conn, sample_strategy, "broker-failed-1", "cancel_failed"
+        )
+
+        mock_broker = MagicMock()
+        mock_broker_cls.return_value = mock_broker
+        mock_broker.list_orders.return_value = [
+            BrokerOrder(
+                broker_order_id="broker-failed-1",
+                client_order_id="nx-test-AAPL-broker-f",
+                status="new",
+                symbol="AAPL",
+                side="buy",
+                qty=10,
+                filled_qty=0,
+                filled_avg_price=None,
+                submitted_at=_now(),
+                filled_at=None,
+            ),
+        ]
+
+        result = ReconcileResult()
+        audit_path = Path("/tmp/nexus-test-audit.jsonl")
+        audit_path.unlink(missing_ok=True)
+        _sync_cancellation_state(conn, result, dry_run=False, audit_path=audit_path)
+
+        # Ghost recorded but no cancel issued
+        assert len(result.ghosts_detected) == 1
+        assert result.ghosts_detected[0]["action"] == "skipped"
+        mock_broker.cancel_order.assert_not_called()
+
+    @patch("nexus.reconciler.AlpacaBroker")
+    def test_dry_run_reports_ghosts_without_changes(
+        self, mock_broker_cls, conn, sample_strategy
+    ):
+        """dry_run=True → reports ghosts but does not call broker."""
+        order_id = _insert_cancel_state_order(
+            conn, sample_strategy, "broker-dry-1", "cancelled"
+        )
+
+        mock_broker = MagicMock()
+        mock_broker_cls.return_value = mock_broker
+        mock_broker.list_orders.return_value = [
+            BrokerOrder(
+                broker_order_id="broker-dry-1",
+                client_order_id="nx-test-AAPL-broker-d",
+                status="new",
+                symbol="AAPL",
+                side="buy",
+                qty=10,
+                filled_qty=0,
+                filled_avg_price=None,
+                submitted_at=_now(),
+                filled_at=None,
+            ),
+        ]
+
+        result = ReconcileResult()
+        audit_path = Path("/tmp/nexus-test-audit.jsonl")
+        audit_path.unlink(missing_ok=True)
+        _sync_cancellation_state(conn, result, dry_run=True, audit_path=audit_path)
+
+        # Ghost reported but no broker cancel, no resolved count
+        assert len(result.ghosts_detected) == 1
+        assert result.ghosts_resolved == 0
+        mock_broker.cancel_order.assert_not_called()
+        row = conn.execute(
+            "SELECT status, cancel_attempts FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        assert row["status"] == "cancelled"
+        assert row["cancel_attempts"] == 0
+
+    @patch("nexus.reconciler.AlpacaBroker")
+    def test_promote_to_cancel_failed_after_repeated_broker_rejects(
+        self, mock_broker_cls, conn, sample_strategy
+    ):
+        """After CANCEL_RETRY_LIMIT broker failures, status becomes cancel_failed."""
+        order_id = _insert_cancel_state_order(
+            conn, sample_strategy,
+            "broker-retry-1",
+            "cancel_pending",
+            cancel_attempts=CANCEL_RETRY_LIMIT - 1,
+        )
+
+        mock_broker = MagicMock()
+        mock_broker_cls.return_value = mock_broker
+        mock_broker.list_orders.return_value = [
+            BrokerOrder(
+                broker_order_id="broker-retry-1",
+                client_order_id="nx-test-AAPL-broker-r",
+                status="new",
+                symbol="AAPL",
+                side="buy",
+                qty=10,
+                filled_qty=0,
+                filled_avg_price=None,
+                submitted_at=_now(),
+                filled_at=None,
+            ),
+        ]
+        mock_broker.cancel_order.side_effect = RuntimeError("still rejecting")
+
+        result = ReconcileResult()
+        audit_path = Path("/tmp/nexus-test-audit.jsonl")
+        audit_path.unlink(missing_ok=True)
+        _sync_cancellation_state(conn, result, dry_run=False, audit_path=audit_path)
+
+        row = conn.execute(
+            "SELECT status, cancel_attempts FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        assert row["status"] == "cancel_failed"
+        # process_cancel_pending bumps to CANCEL_RETRY_LIMIT, then we promote;
+        # process_cancel_failed leaves cancel_attempts at the bumped value.
+        assert row["cancel_attempts"] == CANCEL_RETRY_LIMIT
+        assert result.cancel_failed_count == 1
+
+    @patch("nexus.reconciler.AlpacaBroker")
+    def test_one_list_orders_call_per_profile(
+        self, mock_broker_cls, conn, sample_strategy
+    ):
+        """Reconcile batches by profile: one list_orders call per broker profile,
+        regardless of how many orders are in cancellation-related states."""
+        # Multiple orders in cancellation-related states on the same strategy.
+        _insert_cancel_state_order(conn, sample_strategy, "broker-zzz-AAAA-1", "cancelled")
+        _insert_cancel_state_order(conn, sample_strategy, "broker-yyy-BBBB-2", "cancelled")
+        _insert_cancel_state_order(conn, sample_strategy, "broker-xxw-CCCC-3", "cancel_pending")
+
+        mock_broker = MagicMock()
+        mock_broker_cls.return_value = mock_broker
+        mock_broker.list_orders.return_value = []  # nothing open
+        mock_broker.get_order.side_effect = RuntimeError("not used")
+
+        result = ReconcileResult()
+        audit_path = Path("/tmp/nexus-test-audit.jsonl")
+        audit_path.unlink(missing_ok=True)
+        _sync_cancellation_state(conn, result, dry_run=False, audit_path=audit_path)
+
+        # One list_orders call (not two)
+        assert mock_broker.list_orders.call_count == 1

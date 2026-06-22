@@ -254,6 +254,10 @@ class TestStrategyDelete:
 
         mock_broker = MagicMock()
         mock_broker.cancel_order.return_value = None
+        # Liquidate path verifies broker confirmation before marking cancelled
+        verified = MagicMock()
+        verified.status = "canceled"
+        mock_broker.get_order.return_value = verified
         mock_submit_result = MagicMock()
         mock_submit_result.broker_order_id = "broker-sell-456"
         mock_broker.submit_order.return_value = mock_submit_result

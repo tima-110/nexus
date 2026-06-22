@@ -11,6 +11,8 @@ class TestOrderStatus:
         assert OrderStatus.submitted == "submitted"
         assert OrderStatus.partially_filled == "partially_filled"
         assert OrderStatus.cancelled == "cancelled"
+        assert OrderStatus.cancel_pending == "cancel_pending"
+        assert OrderStatus.cancel_failed == "cancel_failed"
         assert OrderStatus.expired == "expired"
         assert OrderStatus.rejected == "rejected"
 
@@ -22,6 +24,8 @@ class TestOrderStatus:
             "filled",
             "partially_filled",
             "cancelled",
+            "cancel_pending",
+            "cancel_failed",
             "expired",
             "rejected",
         }

@@ -78,6 +78,9 @@ def reconcile(
         "orphans_cleaned": result.orphans_cleaned,
         "bypass_orders": result.bypass_orders,
         "balance_drift": result.balance_drift,
+        "ghosts_detected": result.ghosts_detected,
+        "ghosts_resolved": result.ghosts_resolved,
+        "cancel_failed_count": result.cancel_failed_count,
         "errors": result.errors,
         "dry_run": dry_run,
     }):
@@ -91,6 +94,20 @@ def reconcile(
     typer.echo(f"Orders synced:   {result.orders_synced}")
     typer.echo(f"Orders skipped:  {result.orders_skipped}")
     typer.echo(f"Orphans cleaned: {result.orphans_cleaned}")
+    typer.echo(f"Ghosts detected: {len(result.ghosts_detected)}")
+    if not dry_run:
+        typer.echo(f"Ghosts resolved: {result.ghosts_resolved}")
+        typer.echo(f"Cancel-failed:   {result.cancel_failed_count}")
+
+    if result.ghosts_detected:
+        typer.echo("\nGhost orders (Nexus-cancelled but open on broker):")
+        for g in result.ghosts_detected:
+            action = g.get("action", "?")
+            typer.echo(
+                f"  order_id={g['order_id']} symbol={g['symbol']} "
+                f"strategy={g['strategy']} local={g['local_status']} "
+                f"broker_open={g['broker_open']} action={action}"
+            )
 
     if result.bypass_orders:
         typer.echo(f"\nBypass orders detected ({len(result.bypass_orders)}):")

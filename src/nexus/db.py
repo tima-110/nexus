@@ -106,3 +106,10 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.commit()
     except Exception:
         pass  # column already exists
+
+    # Migration: add cancel_attempts to existing orders tables
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN cancel_attempts INTEGER DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass  # column already exists

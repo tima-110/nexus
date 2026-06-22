@@ -200,7 +200,7 @@ def process_cancel(conn: sqlite3.Connection, order_id: int) -> None:
 
     Steps:
     1. Fetch order row
-    2. Update order: status='cancelled', updated_at
+    2. Update order: status='cancelled', cancel_attempts=0, updated_at
     3. Release reservation (buy: delete reservation row; sell: release_shares)
     4. Commit
     """
@@ -218,7 +218,7 @@ def process_cancel(conn: sqlite3.Connection, order_id: int) -> None:
 
     # Step 2: update order status
     conn.execute(
-        "UPDATE orders SET status = ?, updated_at = ? WHERE id = ?",
+        "UPDATE orders SET status = ?, cancel_attempts = 0, updated_at = ? WHERE id = ?",
         (OrderStatus.cancelled, _now(), order_id),
     )
 
@@ -229,4 +229,45 @@ def process_cancel(conn: sqlite3.Connection, order_id: int) -> None:
         release_shares(conn, strategy_id, symbol, qty)
 
     # Step 4: commit
+    conn.commit()
+
+
+def process_cancel_pending(conn: sqlite3.Connection, order_id: int) -> None:
+    """Mark an order as cancel_pending and bump cancel_attempts.
+
+    Unlike process_cancel, this does NOT release the reservation — the
+    broker order is still open and the shares/cash remain committed there.
+    The reconciler (or a subsequent user-initiated retry) will call
+    process_cancel once the broker confirms cancellation.
+    """
+    order = conn.execute(
+        "SELECT id FROM orders WHERE id = ?", (order_id,)
+    ).fetchone()
+    if order is None:
+        raise ValueError(f"order {order_id} not found")
+
+    conn.execute(
+        "UPDATE orders SET status = ?, cancel_attempts = COALESCE(cancel_attempts, 0) + 1, "
+        "updated_at = ? WHERE id = ?",
+        (OrderStatus.cancel_pending, _now(), order_id),
+    )
+    conn.commit()
+
+
+def process_cancel_failed(conn: sqlite3.Connection, order_id: int) -> None:
+    """Move a cancel_pending order to cancel_failed after exhausting retries.
+
+    Does NOT release the reservation — the broker order is still open and
+    consuming shares/cash. Manual intervention required.
+    """
+    order = conn.execute(
+        "SELECT id FROM orders WHERE id = ?", (order_id,)
+    ).fetchone()
+    if order is None:
+        raise ValueError(f"order {order_id} not found")
+
+    conn.execute(
+        "UPDATE orders SET status = ?, updated_at = ? WHERE id = ?",
+        (OrderStatus.cancel_failed, _now(), order_id),
+    )
     conn.commit()

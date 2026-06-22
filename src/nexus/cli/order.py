@@ -15,6 +15,8 @@ from nexus.guards import check_buy_guard, check_sell_guard
 from nexus.ledger import (
     create_reservation,
     process_cancel,
+    process_cancel_failed,
+    process_cancel_pending,
     release_reservation,
     release_shares,
     reserve_shares,
@@ -43,6 +45,43 @@ def _lookup_strategy(conn, strategy_name: str) -> dict:
         typer.echo(f"Error: strategy '{strategy_name}' not found.", err=True)
         raise typer.Exit(1)
     return row
+
+
+_INSUFFICIENT_QTY_CODE = "40310000"
+
+
+def _looks_like_insufficient_qty(exc: RuntimeError) -> bool:
+    """Detect Alpaca's 'insufficient qty available' error.
+
+    The broker signals this with code 40310000 in the error message. Used
+    by sell/close to suggest a likely ghost-order cause in the failure
+    output.
+    """
+    return _INSUFFICIENT_QTY_CODE in str(exc)
+
+
+def _ghost_order_hint(broker: AlpacaBroker, symbol: str) -> dict:
+    """Return a hint dict listing likely ghost orders consuming a symbol's shares.
+
+    On error, returns an empty dict. The hint is best-effort and never
+    modifies broker state — auto-cancellation stays in the reconciler.
+    """
+    try:
+        open_orders = broker.list_orders("open")
+    except RuntimeError:
+        return {"open_orders": [], "error": "could_not_list_open_orders"}
+    matching = [
+        {
+            "broker_order_id": o.broker_order_id,
+            "client_order_id": o.client_order_id,
+            "side": o.side,
+            "qty": o.qty,
+            "filled_qty": o.filled_qty,
+        }
+        for o in open_orders
+        if o.symbol == symbol and o.side == "sell"
+    ]
+    return {"open_orders": matching}
 
 
 @order_app.command("buy")
@@ -239,8 +278,24 @@ def order_sell(
         )
         release_shares(conn, strategy_id, symbol, qty)
         conn.commit()
-        json_output({"error": f"Broker error: {exc}"})
+        err_payload: dict = {"error": f"Broker error: {exc}"}
+        if _looks_like_insufficient_qty(exc):
+            hint = _ghost_order_hint(broker, symbol)
+            err_payload["hint"] = (
+                "insufficient_qty_available — possibly caused by ghost orders "
+                "consuming shares. Run 'nexus reconcile --dry-run' to inspect."
+            )
+            err_payload["open_orders_on_symbol"] = hint.get("open_orders", [])
+        json_output(err_payload)
         typer.echo(f"Broker error: {exc}", err=True)
+        if _looks_like_insufficient_qty(exc):
+            typer.echo(
+                "Hint: this looks like the 'insufficient qty available' error "
+                "(40310000). It can be caused by ghost orders — Nexus rows "
+                "marked cancelled but still open on Alpaca. Run "
+                "'nexus reconcile --dry-run' to inspect.",
+                err=True,
+            )
         raise typer.Exit(1)
 
     # Update order with broker info
@@ -334,8 +389,24 @@ def order_close(
         )
         release_shares(conn, strategy_id, symbol, available)
         conn.commit()
-        json_output({"error": f"Broker error: {exc}"})
+        err_payload: dict = {"error": f"Broker error: {exc}"}
+        if _looks_like_insufficient_qty(exc):
+            hint = _ghost_order_hint(broker, symbol)
+            err_payload["hint"] = (
+                "insufficient_qty_available — possibly caused by ghost orders "
+                "consuming shares. Run 'nexus reconcile --dry-run' to inspect."
+            )
+            err_payload["open_orders_on_symbol"] = hint.get("open_orders", [])
+        json_output(err_payload)
         typer.echo(f"Broker error: {exc}", err=True)
+        if _looks_like_insufficient_qty(exc):
+            typer.echo(
+                "Hint: this looks like the 'insufficient qty available' error "
+                "(40310000). It can be caused by ghost orders — Nexus rows "
+                "marked cancelled but still open on Alpaca. Run "
+                "'nexus reconcile --dry-run' to inspect.",
+                err=True,
+            )
         raise typer.Exit(1)
 
     conn.execute(
@@ -366,7 +437,13 @@ def order_close(
 def order_cancel(
     order_id: int = typer.Argument(..., help="Order ID to cancel"),
 ) -> None:
-    """Cancel an open order."""
+    """Cancel an open order.
+
+    Confirms cancellation with the broker before marking the order
+    `cancelled` locally. If the broker-side cancel fails or the order is
+    still open on the broker after the call, the order is marked
+    `cancel_pending` so the reconciler can retry on its next sweep.
+    """
     config = load_config()
     audit_path = get_audit_path(config)
 
@@ -388,7 +465,11 @@ def order_cancel(
         typer.echo(f"Error: order {order_id} not found.", err=True)
         raise typer.Exit(1)
 
-    cancellable = {OrderStatus.submitted.value, OrderStatus.partially_filled.value}
+    cancellable = {
+        OrderStatus.submitted.value,
+        OrderStatus.partially_filled.value,
+        OrderStatus.cancel_pending.value,
+    }
     if order["status"] not in cancellable:
         json_output({"error": f"order {order_id} has status '{order['status']}' and cannot be cancelled"})
         typer.echo(
@@ -397,28 +478,102 @@ def order_cancel(
         )
         raise typer.Exit(1)
 
+    broker_order_id = order["broker_order_id"]
     broker = AlpacaBroker(order["broker_profile"])
+
+    # Step 1: send cancel to broker
+    broker_error: str | None = None
     try:
-        broker.cancel_order(order["broker_order_id"])
+        broker.cancel_order(broker_order_id)
     except RuntimeError as exc:
-        json_output({"error": f"Broker error while cancelling: {exc}"})
-        typer.echo(f"Broker error while cancelling: {exc}", err=True)
-        raise typer.Exit(1)
+        broker_error = str(exc)
 
-    process_cancel(conn, order_id)
+    # Step 2: if broker call failed, mark cancel_pending and exit cleanly.
+    # The reconciler will retry on its next sweep.
+    if broker_error is not None:
+        process_cancel_pending(conn, order_id)
+        log_event(audit_path, {
+            "event": "cancel_pending",
+            "order_id": order_id,
+            "client_order_id": order["client_order_id"],
+            "broker_order_id": broker_order_id,
+            "symbol": order["symbol"],
+            "reason": f"broker_error: {broker_error}",
+            "actor": order["actor"] or "cli:manual",
+        })
+        json_output({
+            "status": "pending",
+            "order_id": order_id,
+            "message": (
+                f"Broker cancel failed ({broker_error}); marked cancel_pending. "
+                "Reconciler will retry."
+            ),
+        })
+        typer.echo(
+            f"Warning: broker cancel failed ({broker_error}); "
+            f"order {order_id} marked cancel_pending. "
+            "Reconciler will retry on next sweep.",
+            err=True,
+        )
+        return
 
+    # Step 3: broker call succeeded — verify resulting status.
+    broker_confirmed = False
+    broker_status: str | None = None
+    verify_error: str | None = None
+    try:
+        broker_state = broker.get_order(broker_order_id)
+        broker_status = broker_state.status
+        if broker_status in ("cancelled", "canceled", "expired"):
+            broker_confirmed = True
+    except RuntimeError as exc:
+        verify_error = str(exc)
+
+    if broker_confirmed:
+        process_cancel(conn, order_id)
+        log_event(audit_path, {
+            "event": "order_cancelled",
+            "order_id": order_id,
+            "client_order_id": order["client_order_id"],
+            "broker_order_id": broker_order_id,
+            "symbol": order["symbol"],
+            "actor": order["actor"] or "cli:manual",
+        })
+        if json_output({"status": "ok", "order_id": order_id}):
+            return
+        typer.echo(f"Order {order_id} cancelled.")
+        return
+
+    # Step 4: broker call returned without error but status is still open.
+    # Mark cancel_pending so the reconciler retries.
+    process_cancel_pending(conn, order_id)
     log_event(audit_path, {
-        "event": "order_cancelled",
+        "event": "cancel_pending",
         "order_id": order_id,
         "client_order_id": order["client_order_id"],
-        "broker_order_id": order["broker_order_id"],
+        "broker_order_id": broker_order_id,
         "symbol": order["symbol"],
+        "reason": (
+            f"broker_status_still_open: {broker_status}"
+            if broker_status is not None
+            else f"verify_failed: {verify_error}"
+        ),
         "actor": order["actor"] or "cli:manual",
     })
-
-    if json_output({"status": "ok", "order_id": order_id}):
-        return
-    typer.echo(f"Order {order_id} cancelled.")
+    json_output({
+        "status": "pending",
+        "order_id": order_id,
+        "message": (
+            f"Broker still reports order as '{broker_status or 'unknown'}'; "
+            "marked cancel_pending. Reconciler will retry."
+        ),
+    })
+    typer.echo(
+        f"Warning: broker still reports order as "
+        f"'{broker_status or 'unknown'}'; order {order_id} marked "
+        "cancel_pending. Reconciler will retry on next sweep.",
+        err=True,
+    )
 
 
 @order_app.command("replace")

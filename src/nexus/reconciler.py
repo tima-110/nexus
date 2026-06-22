@@ -7,11 +7,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from nexus.audit import log_event
 from nexus.broker import AlpacaBroker
-from nexus.config import NexusConfig
+from nexus.config import NexusConfig, get_audit_path
+from nexus.ledger import process_cancel, process_cancel_failed, process_cancel_pending
+from nexus.models import OrderStatus
 from nexus.sync import sync_outstanding_orders
 
 ET = ZoneInfo("America/New_York")
+
+CANCEL_RETRY_LIMIT = 3
+CANCELLED_TERMINAL_STATES = {"cancelled", "canceled", "expired"}
 
 
 @dataclass
@@ -22,6 +28,9 @@ class ReconcileResult:
     balance_drift: dict[str, float] = field(default_factory=dict)
     orphans_cleaned: int = 0
     positions_synced: int = 0
+    ghosts_detected: list[dict] = field(default_factory=list)
+    ghosts_resolved: int = 0
+    cancel_failed_count: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -157,7 +166,7 @@ def _cleanup_orphan_reservations(
         SELECT r.id, r.order_id
         FROM reservations r
         JOIN orders o ON r.order_id = o.id
-        WHERE o.status IN ('filled', 'cancelled', 'expired')
+        WHERE o.status IN ('filled', 'cancelled', 'cancel_failed', 'expired')
         """
     ).fetchall()
 
@@ -169,6 +178,178 @@ def _cleanup_orphan_reservations(
         conn.commit()
 
     result.orphans_cleaned = count
+
+
+def _sync_cancellation_state(
+    conn: sqlite3.Connection,
+    result: ReconcileResult,
+    dry_run: bool,
+    audit_path,
+) -> None:
+    """Step 5: Reconcile cancellation state against the broker.
+
+    Cross-checks Nexus orders in cancellation-related states against the
+    broker's open orders:
+
+    - `cancelled` (Nexus) + still open on broker → ghost. Re-issue cancel.
+      On broker failure, bump `cancel_attempts`; promote to `cancel_failed`
+      after CANCEL_RETRY_LIMIT attempts.
+    - `cancel_pending` (Nexus) + cancelled/expired on broker → finalize via
+      `process_cancel`.
+    - `cancel_pending` (Nexus) + still open on broker → re-issue cancel,
+      bump `cancel_attempts`; promote to `cancel_failed` after the limit.
+    - `cancel_failed` (Nexus) → skip (manual intervention required). Logged
+      via audit.
+
+    One `list_orders(status='open')` call per broker profile (deduplicated
+    across strategies).
+    """
+    # Collect candidate orders grouped by broker profile.
+    rows = conn.execute(
+        """
+        SELECT o.id, o.broker_order_id, o.status, o.symbol, o.strategy_id,
+               o.cancel_attempts, s.name AS strategy_name,
+               ba.profile_name AS profile_name
+        FROM orders o
+        JOIN strategies s ON o.strategy_id = s.id
+        JOIN broker_accounts ba ON s.broker_account_id = ba.id
+        WHERE o.status IN ('cancelled', 'cancel_pending', 'cancel_failed')
+          AND o.broker_order_id IS NOT NULL
+        """
+    ).fetchall()
+
+    if not rows:
+        return
+
+    # Group by profile to issue one list_orders call per profile.
+    by_profile: dict[str, list] = {}
+    for row in rows:
+        by_profile.setdefault(row["profile_name"], []).append(row)
+
+    for profile_name, profile_rows in by_profile.items():
+        try:
+            broker = AlpacaBroker(profile_name)
+            open_orders = broker.list_orders("open")
+        except RuntimeError as exc:
+            result.errors.append(f"cancellation_sync({profile_name}): {exc}")
+            continue
+
+        open_ids = {o.broker_order_id for o in open_orders if o.broker_order_id}
+
+        for row in profile_rows:
+            order_id = row["id"]
+            broker_order_id = row["broker_order_id"]
+            status = row["status"]
+            attempts = row["cancel_attempts"] or 0
+            ghost_record = {
+                "order_id": order_id,
+                "broker_order_id": broker_order_id,
+                "symbol": row["symbol"],
+                "strategy": row["strategy_name"],
+                "profile": profile_name,
+                "local_status": status,
+                "broker_open": broker_order_id in open_ids,
+            }
+
+            if status == "cancel_failed":
+                # Already exhausted retries — skip.
+                result.ghosts_detected.append({**ghost_record, "action": "skipped"})
+                continue
+
+            if not ghost_record["broker_open"]:
+                # Broker says it's not open. Verify it's actually terminal,
+                # otherwise we might race with a fill that just happened.
+                # If we can't determine, leave it alone.
+                if status == "cancel_pending":
+                    # Re-check broker state via direct get to be sure.
+                    try:
+                        state = broker.get_order(broker_order_id)
+                        if state.status in CANCELLED_TERMINAL_STATES:
+                            if not dry_run:
+                                process_cancel(conn, order_id)
+                                log_event(audit_path, {
+                                    "event": "ghost_order_resolved",
+                                    "order_id": order_id,
+                                    "broker_order_id": broker_order_id,
+                                    "symbol": row["symbol"],
+                                    "strategy": row["strategy_name"],
+                                    "action": "confirmed_cancelled",
+                                })
+                            result.ghosts_detected.append({**ghost_record, "action": "confirmed_cancelled"})
+                            result.ghosts_resolved += 1
+                        # else: it's filled or otherwise terminal locally
+                        # — process_fill/process_cancel already handles that
+                        # in the eager-sync path.
+                    except RuntimeError as exc:
+                        result.errors.append(
+                            f"cancellation_sync.get_order({broker_order_id}): {exc}"
+                        )
+                # For `cancelled` + not-open: nothing to do, DB is correct.
+                # For `cancel_failed` + not-open: should not happen (broker
+                # caught up), but nothing to do either.
+                continue
+
+            # Ghost detected: Nexus says cancelled/pending, broker still open.
+            result.ghosts_detected.append({**ghost_record, "action": "re_cancel_attempted"})
+
+            if dry_run:
+                continue
+
+            re_cancel_error: str | None = None
+            try:
+                broker.cancel_order(broker_order_id)
+            except RuntimeError as exc:
+                re_cancel_error = str(exc)
+
+            if re_cancel_error is not None:
+                # Broker rejected the re-cancel. Bump counter via process_cancel_pending
+                # (which increments cancel_attempts), then promote to cancel_failed
+                # if we've hit the retry limit.
+                process_cancel_pending(conn, order_id)
+                new_attempts = attempts + 1
+                if new_attempts >= CANCEL_RETRY_LIMIT:
+                    process_cancel_failed(conn, order_id)
+                    log_event(audit_path, {
+                        "event": "cancel_failed",
+                        "order_id": order_id,
+                        "broker_order_id": broker_order_id,
+                        "symbol": row["symbol"],
+                        "strategy": row["strategy_name"],
+                        "cancel_attempts": new_attempts,
+                        "reason": f"re_cancel_failed: {re_cancel_error}",
+                    })
+                    result.cancel_failed_count += 1
+                    result.ghosts_detected.append({
+                        **ghost_record,
+                        "action": "promoted_to_cancel_failed",
+                    })
+                else:
+                    log_event(audit_path, {
+                        "event": "ghost_order_detected",
+                        "order_id": order_id,
+                        "broker_order_id": broker_order_id,
+                        "symbol": row["symbol"],
+                        "strategy": row["strategy_name"],
+                        "cancel_attempts": new_attempts,
+                        "action": "re_cancel_failed",
+                        "error": re_cancel_error,
+                    })
+                continue
+
+            # Re-cancel sent. Mark this sweep as resolved; if the broker
+            # confirms on the next sweep, eager-sync/process_cancel will
+            # finalize the DB state. We don't flip status to 'cancelled'
+            # here — we only flip when we *see* the broker confirm.
+            log_event(audit_path, {
+                "event": "ghost_order_detected",
+                "order_id": order_id,
+                "broker_order_id": broker_order_id,
+                "symbol": row["symbol"],
+                "strategy": row["strategy_name"],
+                "cancel_attempts": attempts,
+                "action": "re_cancelled",
+            })
+            result.ghosts_resolved += 1
 
 
 def run_reconcile(
@@ -191,6 +372,7 @@ def run_reconcile(
     result = ReconcileResult()
     market_hours_only = config.reconciler.market_hours_only
     outside_market = market_hours_only and not _is_market_hours()
+    audit_path = get_audit_path(config)
 
     # Step 1: Balance sync (skip outside market hours if configured)
     if not outside_market:
@@ -209,5 +391,9 @@ def run_reconcile(
     # Step 4: Orphan cleanup (skip outside market hours if configured)
     if not outside_market:
         _cleanup_orphan_reservations(conn, result, dry_run)
+
+    # Step 5: Cancellation-state sync (always runs — safety net for ghost
+    # orders. Critical correctness; should never be gated by market hours.)
+    _sync_cancellation_state(conn, result, dry_run, audit_path)
 
     return result

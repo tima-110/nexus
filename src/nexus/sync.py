@@ -17,7 +17,8 @@ def sync_outstanding_orders(
     """Sync outstanding orders for a strategy before processing new commands.
 
     Steps:
-    1. Query DB for orders with status IN ('submitted', 'partially_filled') AND strategy_id = ?
+    1. Query DB for orders with status IN ('submitted', 'partially_filled',
+       'cancel_pending') AND strategy_id = ?
     2. For each order:
        a. Call broker.get_order_by_client_id(order.client_order_id)
        b. If broker says 'filled' -> call process_fill()
@@ -27,9 +28,14 @@ def sync_outstanding_orders(
     3. Any broker error for a single order -> log/skip, continue to next order
     """
     rows = conn.execute(
-        "SELECT id, client_order_id, filled_qty, filled_avg_price "
-        "FROM orders WHERE strategy_id = ? AND status IN (?, ?)",
-        (strategy_id, OrderStatus.submitted, OrderStatus.partially_filled),
+        "SELECT id, client_order_id, filled_qty, filled_avg_price, status "
+        "FROM orders WHERE strategy_id = ? AND status IN (?, ?, ?)",
+        (
+            strategy_id,
+            OrderStatus.submitted,
+            OrderStatus.partially_filled,
+            OrderStatus.cancel_pending,
+        ),
     ).fetchall()
 
     for row in rows:

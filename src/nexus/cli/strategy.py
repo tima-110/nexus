@@ -383,20 +383,43 @@ def strategy_delete(
         )
 
     from nexus.broker import AlpacaBroker
+    from nexus.ledger import process_cancel_pending
     from nexus.sync import sync_outstanding_orders
 
     broker = AlpacaBroker(broker_profile)
     cancelled_count = 0
+    pending_count = 0
     closed_symbols: list[str] = []
 
-    # Cancel open orders
+    # Cancel open orders — verify broker confirms before marking cancelled.
+    # On broker failure or still-open status, mark cancel_pending instead.
     for order in open_orders:
+        broker_order_id = order["broker_order_id"]
+        broker_error: str | None = None
         try:
-            broker.cancel_order(order["broker_order_id"])
+            broker.cancel_order(broker_order_id)
+        except RuntimeError as exc:
+            broker_error = str(exc)
+
+        if broker_error is not None:
+            process_cancel_pending(conn, order["id"])
+            pending_count += 1
+            continue
+
+        broker_confirmed = False
+        try:
+            broker_state = broker.get_order(broker_order_id)
+            if broker_state.status in ("cancelled", "canceled", "expired"):
+                broker_confirmed = True
         except RuntimeError:
             pass
-        process_cancel(conn, order["id"])
-        cancelled_count += 1
+
+        if broker_confirmed:
+            process_cancel(conn, order["id"])
+            cancelled_count += 1
+        else:
+            process_cancel_pending(conn, order["id"])
+            pending_count += 1
     conn.commit()
 
     # Market sell each position
@@ -466,6 +489,7 @@ def strategy_delete(
         "message": f"Strategy '{name}' liquidated and deleted.",
         "liquidated": {
             "cancelled_orders": cancelled_count,
+            "cancel_pending_orders": pending_count,
             "closed_positions": closed_symbols,
         },
     }
@@ -474,6 +498,8 @@ def strategy_delete(
     typer.echo(f"Strategy '{name}' liquidated and deleted.")
     if cancelled_count:
         typer.echo(f"  Cancelled orders: {cancelled_count}")
+    if pending_count:
+        typer.echo(f"  Cancel-pending orders: {pending_count} (reconciler will retry)")
     if closed_symbols:
         typer.echo(f"  Closed positions: {', '.join(closed_symbols)}")
 
