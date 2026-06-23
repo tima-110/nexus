@@ -84,6 +84,25 @@ def _ghost_order_hint(broker: AlpacaBroker, symbol: str) -> dict:
     return {"open_orders": matching}
 
 
+def _emit_ghost_hint(exc: RuntimeError, broker: AlpacaBroker, symbol: str, err_payload: dict) -> None:
+    """Enrich error payload and echo stderr hint if the error looks like a ghost-order issue."""
+    if not _looks_like_insufficient_qty(exc):
+        return
+    hint = _ghost_order_hint(broker, symbol)
+    err_payload["hint"] = (
+        "insufficient_qty_available — possibly caused by ghost orders "
+        "consuming shares. Run 'nexus reconcile --dry-run' to inspect."
+    )
+    err_payload["open_orders_on_symbol"] = hint.get("open_orders", [])
+    typer.echo(
+        "Hint: this looks like the 'insufficient qty available' error "
+        "(40310000). It can be caused by ghost orders — Nexus rows "
+        "marked cancelled but still open on Alpaca. Run "
+        "'nexus reconcile --dry-run' to inspect.",
+        err=True,
+    )
+
+
 @order_app.command("buy")
 def order_buy(
     symbol: str = typer.Argument(..., help="Ticker symbol"),
@@ -279,23 +298,9 @@ def order_sell(
         release_shares(conn, strategy_id, symbol, qty)
         conn.commit()
         err_payload: dict = {"error": f"Broker error: {exc}"}
-        if _looks_like_insufficient_qty(exc):
-            hint = _ghost_order_hint(broker, symbol)
-            err_payload["hint"] = (
-                "insufficient_qty_available — possibly caused by ghost orders "
-                "consuming shares. Run 'nexus reconcile --dry-run' to inspect."
-            )
-            err_payload["open_orders_on_symbol"] = hint.get("open_orders", [])
+        _emit_ghost_hint(exc, broker, symbol, err_payload)
         json_output(err_payload)
         typer.echo(f"Broker error: {exc}", err=True)
-        if _looks_like_insufficient_qty(exc):
-            typer.echo(
-                "Hint: this looks like the 'insufficient qty available' error "
-                "(40310000). It can be caused by ghost orders — Nexus rows "
-                "marked cancelled but still open on Alpaca. Run "
-                "'nexus reconcile --dry-run' to inspect.",
-                err=True,
-            )
         raise typer.Exit(1)
 
     # Update order with broker info
@@ -390,23 +395,9 @@ def order_close(
         release_shares(conn, strategy_id, symbol, available)
         conn.commit()
         err_payload: dict = {"error": f"Broker error: {exc}"}
-        if _looks_like_insufficient_qty(exc):
-            hint = _ghost_order_hint(broker, symbol)
-            err_payload["hint"] = (
-                "insufficient_qty_available — possibly caused by ghost orders "
-                "consuming shares. Run 'nexus reconcile --dry-run' to inspect."
-            )
-            err_payload["open_orders_on_symbol"] = hint.get("open_orders", [])
+        _emit_ghost_hint(exc, broker, symbol, err_payload)
         json_output(err_payload)
         typer.echo(f"Broker error: {exc}", err=True)
-        if _looks_like_insufficient_qty(exc):
-            typer.echo(
-                "Hint: this looks like the 'insufficient qty available' error "
-                "(40310000). It can be caused by ghost orders — Nexus rows "
-                "marked cancelled but still open on Alpaca. Run "
-                "'nexus reconcile --dry-run' to inspect.",
-                err=True,
-            )
         raise typer.Exit(1)
 
     conn.execute(
@@ -574,6 +565,91 @@ def order_cancel(
         "cancel_pending. Reconciler will retry on next sweep.",
         err=True,
     )
+
+
+@order_app.command("resolve")
+def order_resolve(
+    order_id: int = typer.Argument(..., help="Order ID to resolve"),
+    action: str = typer.Option(
+        ..., "--action", help="Resolution action: 'force-cancel' or 'reset'"
+    ),
+) -> None:
+    """Manually resolve a cancel_failed order.
+
+    Use --action force-cancel to release the reservation (accepting that
+    broker-side state is unknown), or --action reset to move back to
+    cancel_pending so the reconciler retries.
+    """
+    valid_actions = {"force-cancel", "reset"}
+    if action not in valid_actions:
+        json_output({"error": f"--action must be one of: {', '.join(sorted(valid_actions))}"})
+        typer.echo(
+            f"Error: --action must be one of: {', '.join(sorted(valid_actions))}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    config = load_config()
+    audit_path = get_audit_path(config)
+    conn = get_connection()
+    init_db(conn)
+
+    order = conn.execute(
+        "SELECT id, status, symbol, client_order_id, broker_order_id, actor, strategy_id"
+        " FROM orders WHERE id = ?",
+        (order_id,),
+    ).fetchone()
+
+    if order is None:
+        json_output({"error": f"order {order_id} not found"})
+        typer.echo(f"Error: order {order_id} not found.", err=True)
+        raise typer.Exit(1)
+
+    if order["status"] != OrderStatus.cancel_failed.value:
+        json_output({
+            "error": f"order {order_id} has status '{order['status']}'; "
+            "only cancel_failed orders can be resolved"
+        })
+        typer.echo(
+            f"Error: order {order_id} has status '{order['status']}'; "
+            "only cancel_failed orders can be resolved.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    if action == "force-cancel":
+        process_cancel(conn, order_id)
+        log_event(audit_path, {
+            "event": "order_force_cancelled",
+            "order_id": order_id,
+            "client_order_id": order["client_order_id"],
+            "broker_order_id": order["broker_order_id"],
+            "symbol": order["symbol"],
+            "actor": "cli:manual",
+        })
+        if json_output({"status": "ok", "order_id": order_id, "action": "force-cancel"}):
+            return
+        typer.echo(f"Order {order_id} force-cancelled. Reservation released.")
+    else:
+        conn.execute(
+            "UPDATE orders SET status = ?, cancel_attempts = 0, updated_at = ? WHERE id = ?",
+            (OrderStatus.cancel_pending, _now(), order_id),
+        )
+        conn.commit()
+        log_event(audit_path, {
+            "event": "order_reset_to_cancel_pending",
+            "order_id": order_id,
+            "client_order_id": order["client_order_id"],
+            "broker_order_id": order["broker_order_id"],
+            "symbol": order["symbol"],
+            "actor": "cli:manual",
+        })
+        if json_output({"status": "ok", "order_id": order_id, "action": "reset"}):
+            return
+        typer.echo(
+            f"Order {order_id} reset to cancel_pending (attempts=0). "
+            "Reconciler will retry."
+        )
 
 
 @order_app.command("replace")

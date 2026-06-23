@@ -272,3 +272,78 @@ class TestCancelRejectsWrongStatus:
         result = runner.invoke(app, ["order", "cancel", str(order_id)])
         assert result.exit_code != 0
         assert "cannot be cancelled" in result.output
+
+
+class TestOrderResolve:
+    @patch("nexus.cli.order.get_connection")
+    @patch("nexus.cli.order.init_db")
+    def test_resolve_force_cancel_releases_reservation(self, mock_init_db, mock_get_conn):
+        conn, order_id = _setup_conn()
+        _insert_reservation(conn, order_id)
+        conn.execute(
+            "UPDATE orders SET status = 'cancel_failed', cancel_attempts = 3 WHERE id = ?",
+            (order_id,),
+        )
+        conn.commit()
+        mock_get_conn.return_value = conn
+
+        result = runner.invoke(app, ["order", "resolve", str(order_id), "--action", "force-cancel"])
+        assert result.exit_code == 0
+
+        row = conn.execute(
+            "SELECT status, cancel_attempts FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        assert row["status"] == "cancelled"
+        assert row["cancel_attempts"] == 0
+        assert conn.execute(
+            "SELECT * FROM reservations WHERE order_id = ?", (order_id,)
+        ).fetchone() is None
+
+    @patch("nexus.cli.order.get_connection")
+    @patch("nexus.cli.order.init_db")
+    def test_resolve_reset_moves_to_cancel_pending(self, mock_init_db, mock_get_conn):
+        conn, order_id = _setup_conn()
+        _insert_reservation(conn, order_id)
+        conn.execute(
+            "UPDATE orders SET status = 'cancel_failed', cancel_attempts = 3 WHERE id = ?",
+            (order_id,),
+        )
+        conn.commit()
+        mock_get_conn.return_value = conn
+
+        result = runner.invoke(app, ["order", "resolve", str(order_id), "--action", "reset"])
+        assert result.exit_code == 0
+
+        row = conn.execute(
+            "SELECT status, cancel_attempts FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        assert row["status"] == "cancel_pending"
+        assert row["cancel_attempts"] == 0
+        # Reservation NOT released (broker still holds it)
+        assert conn.execute(
+            "SELECT * FROM reservations WHERE order_id = ?", (order_id,)
+        ).fetchone() is not None
+
+    @patch("nexus.cli.order.get_connection")
+    @patch("nexus.cli.order.init_db")
+    def test_resolve_rejects_non_cancel_failed_order(self, mock_init_db, mock_get_conn):
+        conn, order_id = _setup_conn()
+        mock_get_conn.return_value = conn
+
+        result = runner.invoke(app, ["order", "resolve", str(order_id), "--action", "force-cancel"])
+        assert result.exit_code != 0
+        assert "only cancel_failed orders can be resolved" in result.output
+
+    @patch("nexus.cli.order.get_connection")
+    @patch("nexus.cli.order.init_db")
+    def test_resolve_rejects_invalid_action(self, mock_init_db, mock_get_conn):
+        conn, order_id = _setup_conn()
+        conn.execute(
+            "UPDATE orders SET status = 'cancel_failed' WHERE id = ?", (order_id,)
+        )
+        conn.commit()
+        mock_get_conn.return_value = conn
+
+        result = runner.invoke(app, ["order", "resolve", str(order_id), "--action", "nuke"])
+        assert result.exit_code != 0
+        assert "--action must be one of" in result.output
