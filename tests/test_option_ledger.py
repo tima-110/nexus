@@ -53,6 +53,7 @@ class TestProcessOptionFill:
         assert pos["strike"] == 40.0
         assert pos["option_right"] == "put"
         assert pos["underlying"] == "NKE"
+        assert pos["origin_order_id"] == order_id
 
         # Check order marked filled
         order = conn.execute("SELECT status, filled_qty, filled_avg_price FROM orders WHERE id = ?", (order_id,)).fetchone()
@@ -69,39 +70,67 @@ class TestProcessOptionFill:
         assert res["cnt"] == 1  # Still held
 
     def test_buy_fill_closes_short(self, conn, sample_strategy):
-        """Buying to close reduces or removes a short option position."""
+        """Buying to close reduces or removes a short option position and releases the original reservation."""
         strategy_id = sample_strategy
+        now = datetime.now(timezone.utc).isoformat()
 
-        # Create a short option position
+        # Create the original sell order (simulates what option-sell CLI does)
+        sell_order_id = conn.execute(
+            "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, limit_price,"
+            " time_in_force, asset_class, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+            " VALUES (?, 'NKE260718P00040000', 'sell', 1, 'limit', 2.50,"
+            " 'day', 'option', 'filled', 'test-opt-sell-orig', 4000.0, 1, 'test', ?, ?)",
+            (strategy_id, now, now),
+        ).lastrowid
+
+        # Create the assignment reservation under the sell order
+        conn.execute(
+            "INSERT INTO reservations (strategy_id, order_id, amount, created_at) VALUES (?, ?, 4000.0, ?)",
+            (strategy_id, sell_order_id, now),
+        )
+
+        # Create a short option position with origin_order_id pointing to the sell
         conn.execute(
             "INSERT INTO option_positions (strategy_id, symbol, underlying, option_right, side, qty,"
-            " avg_entry_price, strike, expiry, opened_at, updated_at)"
-            " VALUES (?, 'NKE260718P00040000', 'NKE', 'put', 'short', 1, 2.50, 40.0, '2026-07-18', ?, ?)",
-            (strategy_id, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()),
+            " avg_entry_price, strike, expiry, origin_order_id, opened_at, updated_at)"
+            " VALUES (?, 'NKE260718P00040000', 'NKE', 'put', 'short', 1, 2.50, 40.0, '2026-07-18', ?, ?, ?)",
+            (strategy_id, sell_order_id, now, now),
         )
 
         # Create buy-to-close order
-        order_id = conn.execute(
+        buy_order_id = conn.execute(
             "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, limit_price,"
-            " time_in_force, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+            " time_in_force, asset_class, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
             " VALUES (?, 'NKE260718P00040000', 'buy', 1, 'limit', 0.50,"
-            " 'day', 'submitted', 'test-opt-buy-1', 50.0, 0, 'test', ?, ?)",
-            (strategy_id, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()),
+            " 'day', 'option', 'submitted', 'test-opt-buy-1', 50.0, 0, 'test', ?, ?)",
+            (strategy_id, now, now),
         ).lastrowid
+
+        # Create the buy order's own reservation (premium cost)
+        conn.execute(
+            "INSERT INTO reservations (strategy_id, order_id, amount, created_at) VALUES (?, ?, 50.0, ?)",
+            (strategy_id, buy_order_id, now),
+        )
         conn.commit()
 
-        process_option_fill(conn, order_id, 1, 0.50, "2025-01-20T10:00:00Z")
+        process_option_fill(conn, buy_order_id, 1, 0.50, "2025-01-20T10:00:00Z")
 
         # Check position removed
         pos = conn.execute(
             "SELECT * FROM option_positions WHERE strategy_id = ? AND symbol = 'NKE260718P00040000'",
             (strategy_id,),
         ).fetchone()
-        assert pos is None or pos["qty"] == 0
+        assert pos is None
 
         # Check cash debited: 10000 - 50 = 9950
         strat = conn.execute("SELECT cash_balance FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
         assert strat["cash_balance"] == 9950.0
+
+        # CRITICAL: both reservations released (original sell + buy order)
+        res = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM reservations WHERE strategy_id = ?", (strategy_id,)
+        ).fetchone()
+        assert res["cnt"] == 0
 
     def test_buy_fill_opens_long(self, conn, sample_strategy):
         """Buying an option without an existing short opens a long position."""

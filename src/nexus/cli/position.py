@@ -254,8 +254,6 @@ def _show_option_position(
     live_premium = None
     broker = AlpacaBroker(broker_profile)
     try:
-        from nexus.broker.alpaca import AlpacaBroker
-        broker = AlpacaBroker(broker_profile)
         opt_positions = broker.list_option_positions()
         for p in opt_positions:
             if p.symbol == symbol:

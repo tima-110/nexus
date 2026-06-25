@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nexus"
-version = "0.2.5"
+version = "0.3.1"
 description = "Execution gateway and strategy tracking layer for broker APIs."
 requires-python = ">=3.12"
 dependencies = [

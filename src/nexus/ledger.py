@@ -360,10 +360,10 @@ def process_option_fill(
             conn.execute(
                 """INSERT INTO option_positions
                    (strategy_id, symbol, underlying, option_right, side, qty,
-                    avg_entry_price, strike, expiry, opened_at, updated_at)
-                   VALUES (?, ?, ?, ?, 'short', ?, ?, ?, ?, ?, ?)""",
+                    avg_entry_price, strike, expiry, origin_order_id, opened_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'short', ?, ?, ?, ?, ?, ?, ?)""",
                 (strategy_id, symbol, underlying, right, filled_qty,
-                 filled_avg_price, strike, expiry, now, now),
+                 filled_avg_price, strike, expiry, order_id, now, now),
             )
             amount = premium_value
             txn_type = f"open_short_{right}"
@@ -372,13 +372,15 @@ def process_option_fill(
         # Buying an option: we close a short (pay premium)
         # OR open a long (pay premium)
         existing_short = conn.execute(
-            "SELECT id, qty, avg_entry_price FROM option_positions"
+            "SELECT id, qty, avg_entry_price, origin_order_id FROM option_positions"
             " WHERE strategy_id = ? AND symbol = ? AND side = 'short' AND qty > 0",
             (strategy_id, symbol),
         ).fetchone()
 
         if existing_short:
-            # Closing a short position
+            # Closing a short position — release the assignment reservation
+            # that was created under the original sell order
+            origin_order_id = existing_short["origin_order_id"]
             old_qty = existing_short["qty"]
             new_qty = old_qty - filled_qty
             if new_qty <= 0:
@@ -386,20 +388,16 @@ def process_option_fill(
                     "DELETE FROM option_positions WHERE id = ?",
                     (existing_short["id"],),
                 )
-                # Release the assignment reservation
-                conn.execute(
-                    "DELETE FROM reservations WHERE order_id = ?",
-                    (order_id,),
-                )
             else:
                 conn.execute(
                     "UPDATE option_positions SET qty = ?, updated_at = ? WHERE id = ?",
                     (new_qty, now, existing_short["id"]),
                 )
-                # Release pro-rata reservation
+            # Release the assignment reservation keyed to the original sell order
+            if origin_order_id is not None:
                 conn.execute(
                     "DELETE FROM reservations WHERE order_id = ?",
-                    (order_id,),
+                    (origin_order_id,),
                 )
             # Debit: premium paid to close
             amount = -premium_value
@@ -420,8 +418,8 @@ def process_option_fill(
     # Record transaction
     record_transaction(conn, strategy_id, order_id, txn_type, amount, actor)
 
-    # Release any non-assignment reservation (cash reservation for buy orders)
-    if side == OrderSide.buy and not existing_short:
+    # Release the buy order's own cash reservation (premium cost)
+    if side == OrderSide.buy:
         conn.execute("DELETE FROM reservations WHERE order_id = ?", (order_id,))
 
     conn.commit()

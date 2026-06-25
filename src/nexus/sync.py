@@ -7,8 +7,8 @@ import sys
 from datetime import datetime, timezone
 
 from nexus.broker import AlpacaBroker
-from nexus.ledger import process_cancel, process_fill, process_option_fill
-from nexus.models import AssetClass, OrderStatus
+from nexus.ledger import process_cancel, process_cancel_option, process_fill, process_option_fill
+from nexus.models import OrderStatus
 from nexus.occ import is_occ_symbol
 
 
@@ -55,15 +55,17 @@ def sync_outstanding_orders(
 
         broker_status = broker_order.status
 
+        # Fetch symbol once for routing decisions
+        order_row = conn.execute(
+            "SELECT symbol FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        is_option = order_row is not None and is_occ_symbol(order_row["symbol"])
+
         if broker_status == OrderStatus.filled:
             filled_at = broker_order.filled_at or ""
             filled_avg_price = float(broker_order.filled_avg_price) if broker_order.filled_avg_price is not None else 0.0
 
-            # Check if this is an option order
-            order_row = conn.execute(
-                "SELECT symbol FROM orders WHERE id = ?", (order_id,)
-            ).fetchone()
-            if order_row and is_occ_symbol(order_row["symbol"]):
+            if is_option:
                 process_option_fill(
                     conn, order_id, broker_order.filled_qty,
                     filled_avg_price, filled_at,
@@ -73,7 +75,10 @@ def sync_outstanding_orders(
                 process_fill(conn, order_id, broker_order.filled_qty, filled_avg_price, filled_at)
 
         elif broker_status in (OrderStatus.cancelled, OrderStatus.expired):
-            process_cancel(conn, order_id)
+            if is_option:
+                process_cancel_option(conn, order_id)
+            else:
+                process_cancel(conn, order_id)
 
         elif broker_status == OrderStatus.partially_filled:
             db_filled_qty = row["filled_qty"] or 0

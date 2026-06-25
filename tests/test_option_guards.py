@@ -112,3 +112,40 @@ def test_option_buy_guard_cash(conftest):
     ok, reason = check_option_buy_guard(conn, strategy_id, "NKE260718P00040000", 12000.0)
     assert not ok
     assert "insufficient buying power" in reason
+
+
+def test_option_buy_guard_blocks_duplicate_long(conftest):
+    """Buy-to-open is blocked if a long position already exists for the same OCC symbol."""
+    conn, strategy_id = conftest
+
+    # Create an existing long position
+    conn.execute(
+        "INSERT INTO option_positions (strategy_id, symbol, underlying, option_right, side, qty,"
+        " avg_entry_price, strike, expiry, opened_at, updated_at)"
+        " VALUES (?, 'NKE260718P00040000', 'NKE', 'put', 'long', 1, 2.50, 40.0, '2026-07-18',"
+        " '2025-01-01T00:00:00', '2025-01-01T00:00:00')",
+        (strategy_id,),
+    )
+    conn.commit()
+
+    ok, reason = check_option_buy_guard(conn, strategy_id, "NKE260718P00040000", 250.0)
+    assert not ok
+    assert "already holding long position" in reason
+
+
+def test_option_buy_guard_allows_close_short(conftest):
+    """Buy-to-close is allowed even when no long exists (closes short instead)."""
+    conn, strategy_id = conftest
+
+    # Create a short position
+    conn.execute(
+        "INSERT INTO option_positions (strategy_id, symbol, underlying, option_right, side, qty,"
+        " avg_entry_price, strike, expiry, opened_at, updated_at)"
+        " VALUES (?, 'NKE260718P00040000', 'NKE', 'put', 'short', 1, 2.50, 40.0, '2026-07-18',"
+        " '2025-01-01T00:00:00', '2025-01-01T00:00:00')",
+        (strategy_id,),
+    )
+    conn.commit()
+
+    ok, reason = check_option_buy_guard(conn, strategy_id, "NKE260718P00040000", 250.0)
+    assert ok, f"Should pass (closing short): {reason}"

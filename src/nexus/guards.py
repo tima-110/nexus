@@ -164,27 +164,28 @@ def check_option_buy_guard(
     """Check if an option buy order is allowed (close a short or open a long).
 
     For closing a short: strategy must have an open short position in this symbol.
-    For opening a long: sufficient cash available.
+    For opening a long: no existing long position (duplicates blocked), sufficient cash.
 
     Returns (True, "") if OK, (False, "reason") if blocked.
     """
-    parsed = parse_occ_symbol(symbol)
-
     # Check if strategy has a short position in this symbol → closing
-    opt_pos = conn.execute(
+    short_pos = conn.execute(
         "SELECT id, qty FROM option_positions"
         " WHERE strategy_id = ? AND symbol = ? AND side = 'short' AND qty > 0",
         (strategy_id, symbol),
     ).fetchone()
 
-    if opt_pos is not None:
-        # Closing a short — no additional cash check needed if
-        # premium is small (cost < premium collected). But still
-        # verify the cash exists to cover the buy-back cost.
-        # Treat like any buy: check cash.
-        pass
+    if short_pos is None:
+        # Not closing a short — this is a buy-to-open. Block if long already exists.
+        long_pos = conn.execute(
+            "SELECT id FROM option_positions"
+            " WHERE strategy_id = ? AND symbol = ? AND side = 'long' AND qty > 0",
+            (strategy_id, symbol),
+        ).fetchone()
+        if long_pos is not None:
+            return False, f"already holding long position in {symbol}"
 
-    # General cash check for buying options
+    # Cash check for buying options
     strategy = conn.execute(
         "SELECT cash_balance FROM strategies WHERE id = ?",
         (strategy_id,),

@@ -168,6 +168,10 @@ def _cleanup_orphan_reservations(
         FROM reservations r
         JOIN orders o ON r.order_id = o.id
         WHERE o.status IN ('filled', 'cancelled', 'cancel_failed', 'expired')
+          AND r.order_id NOT IN (
+            SELECT origin_order_id FROM option_positions
+            WHERE origin_order_id IS NOT NULL AND qty > 0
+          )
         """
     ).fetchall()
 

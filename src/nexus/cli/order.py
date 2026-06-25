@@ -22,7 +22,7 @@ from nexus.ledger import (
     reserve_shares,
 )
 from nexus.models import AssetClass, OrderSide, OrderStatus, OrderType
-from nexus.occ import is_occ_symbol, occ_to_underlying, parse_occ_symbol
+from nexus.occ import is_occ_symbol, parse_occ_symbol
 from nexus.sync import sync_outstanding_orders
 
 order_app = typer.Typer(name="order", no_args_is_help=True)
@@ -161,8 +161,8 @@ def order_buy(
     cur = conn.execute(
         "INSERT INTO orders"
         " (strategy_id, symbol, side, qty, order_type, limit_price, stop_price, trail_percent,"
-        "  time_in_force, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
-        " VALUES (?, ?, 'buy', ?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, ?, ?, ?)",
+        "  time_in_force, asset_class, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+        " VALUES (?, ?, 'buy', ?, ?, ?, ?, ?, ?, 'equity', 'pending', ?, ?, 0, ?, ?, ?)",
         (
             strategy_id, symbol, qty, order_type,
             limit_price, stop_price, trail_percent, time_in_force,
@@ -265,8 +265,8 @@ def order_sell(
     cur = conn.execute(
         "INSERT INTO orders"
         " (strategy_id, symbol, side, qty, order_type, limit_price, stop_price, trail_percent,"
-        "  time_in_force, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
-        " VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, ?, ?, ?)",
+        "  time_in_force, asset_class, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+        " VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?, 'equity', 'pending', ?, ?, 0, ?, ?, ?)",
         (
             strategy_id, symbol, qty, order_type,
             limit_price, stop_price, trail_percent, time_in_force,
@@ -377,8 +377,8 @@ def order_close(
     cur = conn.execute(
         "INSERT INTO orders"
         " (strategy_id, symbol, side, qty, order_type, limit_price, stop_price, trail_percent,"
-        "  status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
-        " VALUES (?, ?, 'sell', ?, 'market', NULL, NULL, NULL, 'pending', ?, ?, 0, ?, ?, ?)",
+        "  asset_class, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+        " VALUES (?, ?, 'sell', ?, 'market', NULL, NULL, NULL, 'equity', 'pending', ?, ?, 0, ?, ?, ?)",
         (strategy_id, symbol, available, client_order_id, float(available), actor, now, now),
     )
     order_id: int = cur.lastrowid
@@ -713,8 +713,8 @@ def order_option_sell(
     cur = conn.execute(
         "INSERT INTO orders"
         " (strategy_id, symbol, side, qty, order_type, limit_price,"
-        "  time_in_force, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
-        " VALUES (?, ?, 'sell', ?, ?, ?, ?, 'pending', ?, ?, 0, ?, ?, ?)",
+        "  time_in_force, asset_class, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+        " VALUES (?, ?, 'sell', ?, ?, ?, ?, 'option', 'pending', ?, ?, 0, ?, ?, ?)",
         (
             strategy_id, symbol, qty, order_type, limit_price,
             time_in_force, client_order_id, assignment_obligation,
@@ -835,8 +835,8 @@ def order_option_buy(
     cur = conn.execute(
         "INSERT INTO orders"
         " (strategy_id, symbol, side, qty, order_type, limit_price,"
-        "  time_in_force, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
-        " VALUES (?, ?, 'buy', ?, ?, ?, ?, 'pending', ?, ?, 0, ?, ?, ?)",
+        "  time_in_force, asset_class, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+        " VALUES (?, ?, 'buy', ?, ?, ?, ?, 'option', 'pending', ?, ?, 0, ?, ?, ?)",
         (
             strategy_id, symbol, qty, order_type, limit_price,
             time_in_force, client_order_id, estimated_cost,
@@ -1045,10 +1045,8 @@ def order_list(
         query += " AND o.side = ?"
         params.append(side)
     if asset_class is not None:
-        if asset_class == AssetClass.option:
-            query += " AND o.symbol GLOB '*[0-9][0-9][0-9][0-9][0-9][0-9][CP][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*'"
-        else:
-            query += " AND o.symbol NOT GLOB '*[0-9][0-9][0-9][0-9][0-9][0-9][CP][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*'"
+        query += " AND o.asset_class = ?"
+        params.append(asset_class.value)
 
     query += " ORDER BY o.id DESC"
 
@@ -1062,14 +1060,14 @@ def order_list(
         return
 
     header = (
-        f"{'ID':<6} {'STRATEGY':<16} {'SYMBOL':<8} {'SIDE':<5} {'QTY':>6}"
+        f"{'ID':<6} {'STRATEGY':<16} {'SYMBOL':<22} {'SIDE':<5} {'QTY':>6}"
         f" {'TYPE':<14} {'STATUS':<16} {'FILLED':>6} {'CREATED_AT'}"
     )
     typer.echo(header)
     typer.echo("-" * len(header))
     for row in rows:
         typer.echo(
-            f"{row['id']:<6} {row['strategy']:<16} {row['symbol']:<8}"
+            f"{row['id']:<6} {row['strategy']:<16} {row['symbol']:<22}"
             f" {row['side']:<5} {row['qty']:>6}"
             f" {row['order_type']:<14} {row['status']:<16}"
             f" {row['filled_qty']:>6} {row['created_at'] or ''}"

@@ -54,6 +54,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             stop_price          REAL,
             trail_percent       REAL,
             time_in_force       TEXT,
+            asset_class         TEXT    DEFAULT 'equity',
             status              TEXT    NOT NULL,
             client_order_id     TEXT    UNIQUE,
             broker_order_id     TEXT,
@@ -108,6 +109,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             avg_entry_price     REAL,
             strike              REAL    NOT NULL,
             expiry              TEXT    NOT NULL,
+            origin_order_id     INTEGER REFERENCES orders(id),
             opened_at           TEXT,
             updated_at          TEXT,
             UNIQUE (strategy_id, symbol)
@@ -126,6 +128,20 @@ def init_db(conn: sqlite3.Connection) -> None:
     # Migration: add cancel_attempts to existing orders tables
     try:
         conn.execute("ALTER TABLE orders ADD COLUMN cancel_attempts INTEGER DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
+
+    # Migration: add asset_class to existing orders tables
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN asset_class TEXT DEFAULT 'equity'")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
+
+    # Migration: add origin_order_id to existing option_positions tables
+    try:
+        conn.execute("ALTER TABLE option_positions ADD COLUMN origin_order_id INTEGER REFERENCES orders(id)")
         conn.commit()
     except Exception:
         pass  # column already exists
