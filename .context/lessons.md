@@ -27,3 +27,17 @@ import, which always re-binds from the original source — patches on
 **Apply when:** Writing tests that mock a symbol imported via local
 (function-scoped) `from x import y` statements.
 **Global?** Yes — Python import semantics, applies anywhere.
+
+### 2026-06-24: Option assignment reservations must survive fill — released on close, not on open
+**Context:** Implementing option fill processing in `process_option_fill()`. The
+initial assumption was that all reservations are released on fill like equity orders.
+**Insight:** For a cash-secured put, the `strike × 100 × qty` assignment
+reservation is NOT released when the short is opened (sell fills). It stays
+until the short is closed (buy-to-close fill) or the order is cancelled.
+Releasing it on the sell fill would let the strategy use that cash for another
+put, double-spending the assignment collateral. This mirrors the equity model
+where sell orders reserve shares through to the fill — but it's distinct because
+cash continues to be reserved *after* the fill.
+**Apply when:** Designing any option order flow where cash collateral is
+required for assignment risk that persists after the premium is collected.
+**Global?** No — specific to Nexus option trading implementation.

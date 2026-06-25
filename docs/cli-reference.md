@@ -1,6 +1,6 @@
 # Nexus CLI Reference
 
-Complete reference for all `nexus` commands. Version 0.2.2.
+Complete reference for all `nexus` commands. Version 0.3.0.
 
 ---
 
@@ -209,6 +209,7 @@ List orders with optional filters.
 | `--symbol` | str | None | Filter by ticker symbol |
 | `--type` | str | None | Filter by order type (market, limit, stop, stop_limit, trailing_stop) |
 | `--side` | str | None | Filter by side (buy, sell) |
+| `--asset-class` | str | None | Filter by asset class (equity, option) |
 
 **Example:**
 
@@ -217,6 +218,79 @@ nexus order list
 nexus order list --strategy momentum --status submitted
 nexus --json order list --symbol AAPL
 nexus --json order list --strategy momentum --type stop --side sell
+nexus --json order list --asset-class option
+```
+
+---
+
+### `nexus order option-sell`
+
+Sell an option (open a short position — cash-secured put or covered call). For puts: checks available cash >= strike × 100 × qty (assignment obligation). For calls: checks position holds >= 100 × qty shares of underlying. Limit price is required for options (wide spreads make market orders unsafe).
+
+**Synopsis:** `nexus order option-sell SYMBOL QTY [OPTIONS]`
+
+**Arguments:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `SYMBOL` | str | yes | OCC option symbol (e.g., NKE260718P00040000) |
+| `QTY` | int | yes | Number of contracts |
+
+**Options:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--strategy` | str | (required) | Strategy name |
+| `--limit-price` | float | (required) | Limit price per contract |
+| `--type` | str | `limit` | Order type (default: limit) |
+| `--time-in-force` | str | `day` | Time in force (day, gtc) |
+| `--actor` | str | `cli:manual` | Actor identifier for audit trail |
+
+**Example:**
+
+```bash
+# Cash-secured put on NKE at $40 strike
+nexus order option-sell NKE260718P00040000 1 --strategy the_wheel --limit-price 2.50
+
+# Covered call on AAPL at $225 strike
+nexus order option-sell AAPL260821C00225000 1 --strategy the_wheel --limit-price 1.75
+nexus --json order option-sell NKE260718P00040000 1 --strategy the_wheel --limit-price 2.50 --time-in-force gtc
+```
+
+---
+
+### `nexus order option-buy`
+
+Buy an option (close a short position or open a long). Typically used to buy back a short put/call to close the position. Limit price is required for options.
+
+**Synopsis:** `nexus order option-buy SYMBOL QTY [OPTIONS]`
+
+**Arguments:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `SYMBOL` | str | yes | OCC option symbol (e.g., NKE260718P00040000) |
+| `QTY` | int | yes | Number of contracts |
+
+**Options:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--strategy` | str | (required) | Strategy name |
+| `--limit-price` | float | (required) | Limit price per contract |
+| `--type` | str | `limit` | Order type (default: limit) |
+| `--time-in-force` | str | `day` | Time in force (day, gtc) |
+| `--actor` | str | `cli:manual` | Actor identifier for audit trail |
+
+**Example:**
+
+```bash
+# Buy back a short put to close
+nexus order option-buy NKE260718P00040000 1 --strategy the_wheel --limit-price 0.10
+
+# Open a long call position
+nexus order option-buy AAPL260821C00225000 1 --strategy growth --limit-price 3.00
+nexus --json order option-buy NKE260718P00040000 1 --strategy the_wheel --limit-price 0.10 --time-in-force gtc
 ```
 
 ---
@@ -516,6 +590,8 @@ View open positions tracked by Nexus.
 ### `nexus position list`
 
 List open positions across all strategies (or a single strategy).
+Shows both equity and option positions. Options are identified by
+their OCC symbol format and include right, strike, and expiry.
 
 **Synopsis:** `nexus position list [OPTIONS]`
 
@@ -525,9 +601,11 @@ List open positions across all strategies (or a single strategy).
 |------|------|---------|-------------|
 | `--strategy` | str | None | Filter by strategy |
 
-**JSON fields per item:** `strategy`, `symbol`, `qty`, `reserved_qty`, `available`, `avg_entry_price`
+**JSON fields per item:**
 
-`avg_entry_price` is `null` for positions not yet reconciled with the broker. Run `nexus reconcile` to populate it.
+Equity items: `strategy`, `symbol`, `asset_class` (`"equity"`), `qty`, `reserved_qty`, `available`, `avg_entry_price`
+
+Option items: `strategy`, `symbol`, `asset_class` (`"option"`), `underlying`, `right` (`"call"`/`"put"`), `side` (`"short"`/`"long"`), `qty` (contracts), `strike`, `expiry`, `avg_entry_price`
 
 **Example:**
 
@@ -542,6 +620,8 @@ nexus --json position list
 ### `nexus position show`
 
 Show details for a single position including live price if available.
+Accepts both equity symbols and OCC option symbols. For options,
+shows right, strike, expiry, premium collected/paid, and unrealized P&L.
 
 **Synopsis:** `nexus position show STRATEGY SYMBOL`
 
@@ -550,13 +630,15 @@ Show details for a single position including live price if available.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `STRATEGY` | str | yes | Strategy name |
-| `SYMBOL` | str | yes | Ticker symbol |
+| `SYMBOL` | str | yes | Ticker symbol or OCC option symbol |
 
 **Example:**
 
 ```bash
 nexus position show momentum AAPL
 nexus --json position show growth TSLA
+nexus position show the_wheel NKE260718P00040000
+nexus --json position show the_wheel NKE260718P00040000
 ```
 
 ---

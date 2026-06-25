@@ -81,10 +81,10 @@ nexus config path          # print config file location
 
 | Group | Subcommands | Description |
 |-------|-------------|-------------|
-| `order` | buy, sell, close, cancel, replace, status, list | Place and manage orders |
+| `order` | buy, sell, close, cancel, replace, status, list, option-sell, option-buy | Place and manage equity and options orders |
 | `strategy` | create, list, show, deposit, withdraw, set-broker | Manage virtual strategy accounts |
 | `broker` | add, list, show, sync, remove | Register and inspect broker connections |
-| `position` | list, show | View current holdings per strategy |
+| `position` | list, show | View current equity and option holdings per strategy |
 | `history` | (filter flags) | Query fills filtered by strategy, symbol, or date |
 | `config` | show, set, path | View and modify configuration |
 | `reconcile` | — | Manually trigger a reconciliation sweep |
@@ -94,6 +94,15 @@ nexus config path          # print config file location
 | `doctor` | — | Diagnose common setup issues |
 
 See [docs/cli-reference.md](docs/cli-reference.md) for full command details.
+
+Nexus supports both equity and option orders. Option symbols use OCC
+format (e.g., `NKE260718P00040000`):
+- `order option-sell` — sell cash-secured puts or covered calls
+- `order option-buy` — buy options to close shorts or open longs
+- `position list` — shows both equity and option positions
+- `position show` — OCC-aware with premium, strike, expiry, P&L
+
+See [Options Implementation Plan](docs/superpowers/plans/2026-06-24-options-implementation.md) for details.
 
 ## For AI Agents
 

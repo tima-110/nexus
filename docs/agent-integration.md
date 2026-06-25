@@ -73,8 +73,11 @@ nexus --json order buy AAPL 10 --strategy my_strat
 | `nexus --json order list --strategy <name>` | List orders | List |
 | `nexus --json order list --strategy <name> --status submitted` | List open orders | List |
 | `nexus --json order list --strategy <name> --type stop --side sell` | List stop-sell orders | List |
-| `nexus --json position list --strategy <name>` | List positions with avg_entry_price | List |
-| `nexus --json position show <strategy> <symbol>` | Show one position | Single entity |
+| `nexus --json order list --asset-class option` | List option orders only | List |
+| `nexus --json order option-sell <OCC> <qty> --strategy <name> --limit-price <p>` | Sell put/call (open short) | Confirmation |
+| `nexus --json order option-buy <OCC> <qty> --strategy <name> --limit-price <p>` | Buy option (close short or open long) | Confirmation |
+| `nexus --json position list --strategy <name>` | List positions (equity + options) with avg_entry_price | List |
+| `nexus --json position show <strategy> <symbol>` | Show one position (equity or OCC) | Single entity |
 | `nexus --json strategy delete <name> --yes` | Delete a strategy | Confirmation |
 | `nexus --json strategy delete <name> --liquidate --yes` | Liquidate and delete | Confirmation |
 | `nexus --json reconcile --strategy <name>` | Force sync with broker | Reconcile result |
@@ -219,6 +222,62 @@ nexus --json order list --strategy my_strat --status submitted
 ```
 
 ---
+
+## Workflow: Selling a Cash-Secured Put (Wheel Strategy)
+
+```bash
+# 1. Check available cash (cash_balance - active reservations)
+nexus --json strategy show the_wheel
+# Look at: cash_balance, total_equity
+
+# 2. Sell a put — limit price required
+nexus --json order option-sell NKE260718P00040000 1 \
+  --strategy the_wheel \
+  --limit-price 2.50 \
+  --actor "agent:the_wheel"
+# Returns:
+# {"status": "ok", "order_id": 10, "client_order_id": "nx-wheel-NKE260718P-..."}
+# Reservation: $40.00 × 100 × 1 = $4,000 assigned (full strike obligation)
+
+# 3. Check the option position
+nexus --json position show the_wheel NKE260718P00040000
+# Look at: side (short), qty (1), avg_entry_price (2.50), premium_collected (250.00)
+
+# 4. Buy back to close (if rolling or taking profit)
+nexus --json order option-buy NKE260718P00040000 1 \
+  --strategy the_wheel \
+  --limit-price 0.10 \
+  --actor "agent:the_wheel"
+```
+
+## Workflow: Selling a Covered Call
+
+```bash
+# 1. Verify underlying position
+nexus --json position show the_wheel AAPL
+# Check: qty >= 100
+
+# 2. Sell a covered call — needs 100 shares per contract
+nexus --json order option-sell AAPL260821C00225000 1 \
+  --strategy the_wheel \
+  --limit-price 1.75 \
+  --actor "agent:the_wheel"
+# No cash reservation for calls (no assignment risk — shares are delivered)
+
+# 3. Monitor option position
+nexus --json position list --strategy the_wheel
+# Shows both equity (AAPL) and option (AAPL260821C00225000) positions
+```
+
+## Notes for Option Trading
+
+- **Always use `--limit-price`** — options have wide spreads. Market orders are disabled by default.
+- **OCC symbol format**: `ROOT (1-6 chars) + YYMMDD + C/P + 8-digit strike × 1000`
+  - `NKE260718P00040000` → NKE, exp 2026-07-18, Put, $40.00 strike
+- **Cash reservation**: selling a put reserves `strike × 100 × qty` (full assignment obligation). This is released when the short is closed via `option-buy`.
+- **Check `position list`** for both equity and option positions — they appear mixed with an `asset_class` field.
+- **Filter orders** with `order list --asset-class option` to see only option orders.
+- **Position show** with an OCC symbol shows option-specific fields: right, strike, expiry, side, premium, unrealized P&L.
 
 ## Best Practices
 
