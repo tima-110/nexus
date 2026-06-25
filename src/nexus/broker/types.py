@@ -32,3 +32,17 @@ class BrokerPosition:
     avg_entry_price: Decimal
     current_price: Decimal
     unrealized_pl: Decimal
+
+
+@dataclass
+class BrokerOptionPosition:
+    symbol: str
+    underlying: str
+    side: str           # "short" | "long"
+    qty: int
+    avg_entry_price: Decimal
+    current_price: Decimal
+    unrealized_pl: Decimal
+    strike: Decimal
+    expiry: str
+    option_right: str   # "call" | "put"

@@ -4,7 +4,8 @@ import json
 import subprocess
 from decimal import Decimal
 
-from nexus.broker.types import BrokerAccount, BrokerOrder, BrokerPosition
+from nexus.broker.types import BrokerAccount, BrokerOrder, BrokerPosition, BrokerOptionPosition
+from nexus.occ import parse_occ_symbol
 
 
 class AlpacaBroker:
@@ -127,7 +128,43 @@ class AlpacaBroker:
                 unrealized_pl=Decimal(str(item["unrealized_pl"])),
             )
             for item in data
+            if item.get("asset_class") != "us_option"
         ]
+
+    def list_option_positions(self) -> list[BrokerOptionPosition]:
+        """Get all option positions from the broker."""
+        data = self._run("position", "list")
+        options = []
+        for item in data:
+            if item.get("asset_class") != "us_option":
+                continue
+            occ = item["symbol"]
+            try:
+                parsed = parse_occ_symbol(occ)
+            except ValueError:
+                # Fallback if OCC parsing fails
+                parsed = {
+                    "root": item.get("underlying_symbol", ""),
+                    "strike": 0.0,
+                    "expiry": "",
+                    "right": "put",
+                }
+
+            options.append(
+                BrokerOptionPosition(
+                    symbol=occ,
+                    underlying=item.get("underlying_symbol", parsed["root"]),
+                    side=item.get("side", "short"),  # Alpaca returns "short" or "long"
+                    qty=int(item["qty"]),
+                    avg_entry_price=Decimal(str(item["avg_entry_price"])),
+                    current_price=Decimal(str(item["current_price"])),
+                    unrealized_pl=Decimal(str(item["unrealized_pl"])),
+                    strike=Decimal(str(item.get("strike_price", parsed["strike"]))),
+                    expiry=item.get("expiration_date", parsed["expiry"]),
+                    option_right=parsed["right"],
+                )
+            )
+        return options
 
     def get_last_price(self, symbol: str) -> Decimal:
         data = self._run("data", "latest-trade", "--symbol", symbol)

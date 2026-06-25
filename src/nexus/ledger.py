@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 
-from nexus.models import OrderSide, OrderStatus, TransactionType
+from nexus.models import AssetClass, OrderSide, OrderStatus, OptionRight, TransactionType
 
 
 def _now() -> str:
@@ -229,6 +229,201 @@ def process_cancel(conn: sqlite3.Connection, order_id: int) -> None:
         release_shares(conn, strategy_id, symbol, qty)
 
     # Step 4: commit
+    conn.commit()
+
+
+def process_cancel_option(conn: sqlite3.Connection, order_id: int) -> None:
+    """Process option order cancellation.
+
+    For option sells (short opens), releases the assignment reservation
+    (strike * 100 * qty). For option buys, releases the cash reservation.
+    """
+    order = conn.execute(
+        "SELECT strategy_id, symbol, side, qty FROM orders WHERE id = ?",
+        (order_id,),
+    ).fetchone()
+    if order is None:
+        raise ValueError(f"order {order_id} not found")
+
+    strategy_id = order["strategy_id"]
+    symbol = order["symbol"]
+    side = order["side"]
+    qty = order["qty"]
+
+    # Step 2: update order status
+    conn.execute(
+        "UPDATE orders SET status = ?, cancel_attempts = 0, updated_at = ? WHERE id = ?",
+        (OrderStatus.cancelled, _now(), order_id),
+    )
+
+    # Step 3: release reservation
+    if side == OrderSide.buy:
+        release_reservation(conn, order_id)
+    else:
+        # Option sell cancelled — release assignment reservation
+        release_reservation(conn, order_id)
+
+    # Step 4: commit
+    conn.commit()
+
+
+_CONTRACT_MULTIPLIER = 100
+
+
+def _option_fill_value(qty: int, price: float) -> float:
+    """Compute notional value of an option fill: qty * price * 100."""
+    return float(qty * price * _CONTRACT_MULTIPLIER)
+
+
+def process_option_fill(
+    conn: sqlite3.Connection,
+    order_id: int,
+    filled_qty: int,
+    filled_avg_price: float,
+    filled_at: str,
+    filled_side: str | None = None,
+) -> None:
+    """Atomic processing of an option order fill.
+
+    Handles four cases:
+    1. Sell fill → short opened (credit premium, create option_position)
+    2. Buy fill  → short closed (debit premium, reduce/remove option_position)
+    3. Buy fill  → long opened (debit premium, create option_position)
+    4. Sell fill → long closed (credit premium, reduce/remove option_position)
+
+    For short positions (case 1): reserves the assignment obligation
+    (strike * 100 * qty) and does NOT release it on fill — it's held until
+    the position is closed via case 2.
+
+    Args:
+        filled_side: Override the order's side (used when the broker reports
+            a different side than what we stored, e.g. buy-to-close).
+    """
+    order = conn.execute(
+        "SELECT strategy_id, symbol, side, qty, actor FROM orders WHERE id = ?",
+        (order_id,),
+    ).fetchone()
+    if order is None:
+        raise ValueError(f"order {order_id} not found")
+
+    strategy_id = order["strategy_id"]
+    symbol = order["symbol"]
+    side = filled_side or order["side"]
+    actor = order["actor"] or "system"
+
+    # Parse OCC to get option details
+    from nexus.occ import parse_occ_symbol
+    parsed = parse_occ_symbol(symbol)
+    right = parsed["right"]
+    strike = parsed["strike"]
+    expiry = parsed["expiry"]
+    underlying = parsed["root"]
+
+    now = _now()
+    premium_value = _option_fill_value(filled_qty, filled_avg_price)
+
+    # Update order status
+    conn.execute(
+        "UPDATE orders SET status = ?, filled_qty = ?, filled_avg_price = ?, "
+        "filled_at = ?, updated_at = ? WHERE id = ?",
+        (OrderStatus.filled, filled_qty, filled_avg_price, filled_at, now, order_id),
+    )
+
+    if side == OrderSide.sell:
+        # Selling an option: we open a short (collect premium)
+        # OR close a long (pay back premium)
+        existing_long = conn.execute(
+            "SELECT id, qty, avg_entry_price FROM option_positions"
+            " WHERE strategy_id = ? AND symbol = ? AND side = 'long' AND qty > 0",
+            (strategy_id, symbol),
+        ).fetchone()
+
+        if existing_long:
+            # Closing a long position
+            old_qty = existing_long["qty"]
+            new_qty = old_qty - filled_qty
+            if new_qty <= 0:
+                conn.execute(
+                    "DELETE FROM option_positions WHERE id = ?",
+                    (existing_long["id"],),
+                )
+            else:
+                conn.execute(
+                    "UPDATE option_positions SET qty = ?, updated_at = ? WHERE id = ?",
+                    (new_qty, now, existing_long["id"]),
+                )
+            # Credit: premium received on close
+            amount = premium_value
+            txn_type = f"close_{right}"
+        else:
+            # Opening a short position
+            conn.execute(
+                """INSERT INTO option_positions
+                   (strategy_id, symbol, underlying, option_right, side, qty,
+                    avg_entry_price, strike, expiry, opened_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'short', ?, ?, ?, ?, ?, ?)""",
+                (strategy_id, symbol, underlying, right, filled_qty,
+                 filled_avg_price, strike, expiry, now, now),
+            )
+            amount = premium_value
+            txn_type = f"open_short_{right}"
+
+    else:
+        # Buying an option: we close a short (pay premium)
+        # OR open a long (pay premium)
+        existing_short = conn.execute(
+            "SELECT id, qty, avg_entry_price FROM option_positions"
+            " WHERE strategy_id = ? AND symbol = ? AND side = 'short' AND qty > 0",
+            (strategy_id, symbol),
+        ).fetchone()
+
+        if existing_short:
+            # Closing a short position
+            old_qty = existing_short["qty"]
+            new_qty = old_qty - filled_qty
+            if new_qty <= 0:
+                conn.execute(
+                    "DELETE FROM option_positions WHERE id = ?",
+                    (existing_short["id"],),
+                )
+                # Release the assignment reservation
+                conn.execute(
+                    "DELETE FROM reservations WHERE order_id = ?",
+                    (order_id,),
+                )
+            else:
+                conn.execute(
+                    "UPDATE option_positions SET qty = ?, updated_at = ? WHERE id = ?",
+                    (new_qty, now, existing_short["id"]),
+                )
+                # Release pro-rata reservation
+                conn.execute(
+                    "DELETE FROM reservations WHERE order_id = ?",
+                    (order_id,),
+                )
+            # Debit: premium paid to close
+            amount = -premium_value
+            txn_type = f"close_short_{right}"
+        else:
+            # Opening a long position
+            conn.execute(
+                """INSERT INTO option_positions
+                   (strategy_id, symbol, underlying, option_right, side, qty,
+                    avg_entry_price, strike, expiry, opened_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?)""",
+                (strategy_id, symbol, underlying, right, filled_qty,
+                 filled_avg_price, strike, expiry, now, now),
+            )
+            amount = -premium_value
+            txn_type = f"open_long_{right}"
+
+    # Record transaction
+    record_transaction(conn, strategy_id, order_id, txn_type, amount, actor)
+
+    # Release any non-assignment reservation (cash reservation for buy orders)
+    if side == OrderSide.buy and not existing_short:
+        conn.execute("DELETE FROM reservations WHERE order_id = ?", (order_id,))
+
     conn.commit()
 
 

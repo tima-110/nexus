@@ -96,6 +96,22 @@ def init_db(conn: sqlite3.Connection) -> None:
             amount              REAL    NOT NULL,
             created_at          TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS option_positions (
+            id                  INTEGER PRIMARY KEY,
+            strategy_id         INTEGER NOT NULL REFERENCES strategies(id),
+            symbol              TEXT    NOT NULL,
+            underlying          TEXT    NOT NULL,
+            option_right        TEXT    NOT NULL,
+            side                TEXT    NOT NULL,
+            qty                 INTEGER NOT NULL,
+            avg_entry_price     REAL,
+            strike              REAL    NOT NULL,
+            expiry              TEXT    NOT NULL,
+            opened_at           TEXT,
+            updated_at          TEXT,
+            UNIQUE (strategy_id, symbol)
+        );
         """
     )
     conn.commit()

@@ -11,7 +11,7 @@ from nexus.broker import AlpacaBroker
 from nexus.cli import json_output
 from nexus.config import load_config, get_audit_path
 from nexus.db import get_connection, init_db
-from nexus.guards import check_buy_guard, check_sell_guard
+from nexus.guards import check_buy_guard, check_option_sell_guard, check_sell_guard
 from nexus.ledger import (
     create_reservation,
     process_cancel,
@@ -21,7 +21,8 @@ from nexus.ledger import (
     release_shares,
     reserve_shares,
 )
-from nexus.models import OrderSide, OrderStatus, OrderType
+from nexus.models import AssetClass, OrderSide, OrderStatus, OrderType
+from nexus.occ import is_occ_symbol, occ_to_underlying, parse_occ_symbol
 from nexus.sync import sync_outstanding_orders
 
 order_app = typer.Typer(name="order", no_args_is_help=True)
@@ -652,6 +653,253 @@ def order_resolve(
         )
 
 
+@order_app.command("option-sell")
+def order_option_sell(
+    symbol: str = typer.Argument(..., help="OCC option symbol (e.g., NKE260718P00040000)"),
+    qty: int = typer.Argument(..., help="Number of contracts"),
+    strategy: str = typer.Option(..., "--strategy", help="Strategy name"),
+    limit_price: float = typer.Option(..., "--limit-price", help="Limit price per contract"),
+    order_type: str = typer.Option("limit", "--type", help="Order type (default: limit)"),
+    time_in_force: str | None = typer.Option("day", "--time-in-force", help="Time in force (day, gtc)"),
+    actor: str = typer.Option("cli:manual", "--actor"),
+) -> None:
+    """Sell an option (open a short position — cash-secured put or covered call).
+
+    For puts: checks available cash >= strike * 100 * qty (assignment obligation).
+    For calls: checks position holds >= 100 * qty shares of underlying.
+
+    Limit price is required for options (wide spreads make market orders unsafe).
+    """
+    if not is_occ_symbol(symbol):
+        json_output({"error": f"'{symbol}' is not a valid OCC option symbol"})
+        typer.echo(f"Error: '{symbol}' is not a valid OCC option symbol.", err=True)
+        raise typer.Exit(1)
+
+    config = load_config()
+    audit_path = get_audit_path(config)
+
+    conn = get_connection()
+    init_db(conn)
+
+    strat = _lookup_strategy(conn, strategy)
+    strategy_id: int = strat["id"]
+    broker_profile: str = strat["broker_profile"]
+    broker = AlpacaBroker(broker_profile)
+
+    # Eager sync
+    sync_outstanding_orders(conn, strategy_id, broker)
+
+    # Parse OCC for guard check
+    parsed = parse_occ_symbol(symbol)
+    right = parsed["right"]
+    strike = parsed["strike"]
+
+    # Guard check
+    ok, reason = check_option_sell_guard(conn, strategy_id, symbol, qty)
+    if not ok:
+        json_output({"error": f"Option sell blocked: {reason}"})
+        typer.echo(f"Option sell blocked: {reason}", err=True)
+        raise typer.Exit(1)
+
+    client_order_id = f"nx-{strategy[:6]}-{symbol}-{uuid4().hex[:8]}"
+    now = _now()
+
+    # Determine reservation amount:
+    # - Put: reserve strike * 100 * qty (assignment obligation)
+    # - Call: reserve 0 (covered call needs no cash outlay)
+    assignment_obligation = strike * 100 * qty if right == "put" else 0.0
+
+    # Insert order record
+    cur = conn.execute(
+        "INSERT INTO orders"
+        " (strategy_id, symbol, side, qty, order_type, limit_price,"
+        "  time_in_force, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+        " VALUES (?, ?, 'sell', ?, ?, ?, ?, 'pending', ?, ?, 0, ?, ?, ?)",
+        (
+            strategy_id, symbol, qty, order_type, limit_price,
+            time_in_force, client_order_id, assignment_obligation,
+            actor, now, now,
+        ),
+    )
+    order_id: int = cur.lastrowid
+
+    # Create cash reservation (for puts — assignment obligation)
+    if assignment_obligation > 0:
+        create_reservation(conn, strategy_id, order_id, assignment_obligation)
+    conn.commit()
+
+    # Submit to broker
+    try:
+        result = broker.submit_order(
+            symbol, qty, "sell", order_type,
+            client_order_id=client_order_id,
+            limit_price=limit_price,
+            time_in_force=time_in_force,
+        )
+    except RuntimeError as exc:
+        # Roll back
+        conn.execute(
+            "UPDATE orders SET status = 'cancelled', updated_at = ? WHERE id = ?",
+            (_now(), order_id),
+        )
+        if assignment_obligation > 0:
+            release_reservation(conn, order_id)
+        conn.commit()
+        err_payload: dict = {"error": f"Broker error: {exc}"}
+        json_output(err_payload)
+        typer.echo(f"Broker error: {exc}", err=True)
+        raise typer.Exit(1)
+
+    # Update order with broker info
+    conn.execute(
+        "UPDATE orders SET status = 'submitted', broker_order_id = ?, updated_at = ? WHERE id = ?",
+        (result.broker_order_id, _now(), order_id),
+    )
+    conn.commit()
+
+    log_event(audit_path, {
+        "event": "order_submitted",
+        "side": "option_sell",
+        "right": right,
+        "strategy": strategy,
+        "symbol": symbol,
+        "underlying": parsed["root"],
+        "strike": strike,
+        "expiry": parsed["expiry"],
+        "qty": qty,
+        "order_type": order_type,
+        "limit_price": limit_price,
+        "time_in_force": time_in_force,
+        "client_order_id": client_order_id,
+        "broker_order_id": result.broker_order_id,
+        "assignment_obligation": assignment_obligation,
+        "actor": actor,
+    })
+
+    if json_output({"status": "ok", "order_id": order_id, "client_order_id": client_order_id, "message": f"Option sell submitted: {client_order_id}"}):
+        return
+    typer.echo(f"Option sell submitted: {client_order_id}")
+
+
+@order_app.command("option-buy")
+def order_option_buy(
+    symbol: str = typer.Argument(..., help="OCC option symbol (e.g., NKE260718P00040000)"),
+    qty: int = typer.Argument(..., help="Number of contracts"),
+    strategy: str = typer.Option(..., "--strategy", help="Strategy name"),
+    limit_price: float = typer.Option(..., "--limit-price", help="Limit price per contract"),
+    order_type: str = typer.Option("limit", "--type", help="Order type (default: limit)"),
+    time_in_force: str | None = typer.Option("day", "--time-in-force", help="Time in force (day, gtc)"),
+    actor: str = typer.Option("cli:manual", "--actor"),
+) -> None:
+    """Buy an option (close a short position or open a long).
+
+    Typically used to buy back a short put/call to close the position.
+    Limit price is required for options.
+    """
+    if not is_occ_symbol(symbol):
+        json_output({"error": f"'{symbol}' is not a valid OCC option symbol"})
+        typer.echo(f"Error: '{symbol}' is not a valid OCC option symbol.", err=True)
+        raise typer.Exit(1)
+
+    config = load_config()
+    audit_path = get_audit_path(config)
+
+    conn = get_connection()
+    init_db(conn)
+
+    strat = _lookup_strategy(conn, strategy)
+    strategy_id: int = strat["id"]
+    broker_profile: str = strat["broker_profile"]
+    broker = AlpacaBroker(broker_profile)
+
+    # Eager sync
+    sync_outstanding_orders(conn, strategy_id, broker)
+
+    parsed = parse_occ_symbol(symbol)
+    right = parsed["right"]
+
+    # Estimate cost
+    estimated_cost = limit_price * 100 * qty
+
+    # Guard check
+    ok, reason = check_buy_guard(conn, strategy_id, symbol, estimated_cost)
+    if not ok:
+        json_output({"error": f"Option buy blocked: {reason}"})
+        typer.echo(f"Option buy blocked: {reason}", err=True)
+        raise typer.Exit(1)
+
+    client_order_id = f"nx-{strategy[:6]}-{symbol}-{uuid4().hex[:8]}"
+    now = _now()
+
+    # Insert order record
+    cur = conn.execute(
+        "INSERT INTO orders"
+        " (strategy_id, symbol, side, qty, order_type, limit_price,"
+        "  time_in_force, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+        " VALUES (?, ?, 'buy', ?, ?, ?, ?, 'pending', ?, ?, 0, ?, ?, ?)",
+        (
+            strategy_id, symbol, qty, order_type, limit_price,
+            time_in_force, client_order_id, estimated_cost,
+            actor, now, now,
+        ),
+    )
+    order_id: int = cur.lastrowid
+
+    # Create cash reservation
+    create_reservation(conn, strategy_id, order_id, estimated_cost)
+    conn.commit()
+
+    # Submit to broker
+    try:
+        result = broker.submit_order(
+            symbol, qty, "buy", order_type,
+            client_order_id=client_order_id,
+            limit_price=limit_price,
+            time_in_force=time_in_force,
+        )
+    except RuntimeError as exc:
+        conn.execute(
+            "UPDATE orders SET status = 'cancelled', updated_at = ? WHERE id = ?",
+            (_now(), order_id),
+        )
+        release_reservation(conn, order_id)
+        conn.commit()
+        err_payload: dict = {"error": f"Broker error: {exc}"}
+        json_output(err_payload)
+        typer.echo(f"Broker error: {exc}", err=True)
+        raise typer.Exit(1)
+
+    # Update order with broker info
+    conn.execute(
+        "UPDATE orders SET status = 'submitted', broker_order_id = ?, updated_at = ? WHERE id = ?",
+        (result.broker_order_id, _now(), order_id),
+    )
+    conn.commit()
+
+    log_event(audit_path, {
+        "event": "order_submitted",
+        "side": "option_buy",
+        "right": right,
+        "strategy": strategy,
+        "symbol": symbol,
+        "underlying": parsed["root"],
+        "strike": parsed["strike"],
+        "expiry": parsed["expiry"],
+        "qty": qty,
+        "order_type": order_type,
+        "limit_price": limit_price,
+        "time_in_force": time_in_force,
+        "client_order_id": client_order_id,
+        "broker_order_id": result.broker_order_id,
+        "estimated_cost": estimated_cost,
+        "actor": actor,
+    })
+
+    if json_output({"status": "ok", "order_id": order_id, "client_order_id": client_order_id, "message": f"Option buy submitted: {client_order_id}"}):
+        return
+    typer.echo(f"Option buy submitted: {client_order_id}")
+
+
 @order_app.command("replace")
 def order_replace(
     order_id: int = typer.Argument(..., help="Nexus order ID"),
@@ -766,6 +1014,7 @@ def order_list(
     symbol: str | None = typer.Option(None, "--symbol"),
     order_type: OrderType | None = typer.Option(None, "--type", help="Filter by order type"),
     side: OrderSide | None = typer.Option(None, "--side", help="Filter by side"),
+    asset_class: AssetClass | None = typer.Option(None, "--asset-class", help="Filter by asset class"),
 ) -> None:
     """List orders with optional filters."""
     conn = get_connection()
@@ -795,6 +1044,11 @@ def order_list(
     if side is not None:
         query += " AND o.side = ?"
         params.append(side)
+    if asset_class is not None:
+        if asset_class == AssetClass.option:
+            query += " AND o.symbol GLOB '*[0-9][0-9][0-9][0-9][0-9][0-9][CP][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*'"
+        else:
+            query += " AND o.symbol NOT GLOB '*[0-9][0-9][0-9][0-9][0-9][0-9][CP][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*'"
 
     query += " ORDER BY o.id DESC"
 

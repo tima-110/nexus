@@ -34,3 +34,13 @@ class TransactionType(str, Enum):
     deposit = "deposit"
     withdrawal = "withdrawal"
     adjustment = "adjustment"
+
+
+class OptionRight(str, Enum):
+    call = "call"
+    put = "put"
+
+
+class AssetClass(str, Enum):
+    equity = "equity"
+    option = "option"

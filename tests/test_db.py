@@ -19,7 +19,7 @@ def empty_conn():
 
 
 class TestInitDb:
-    def test_all_six_tables_exist(self, empty_conn):
+    def test_all_tables_exist(self, empty_conn):
         init_db(empty_conn)
         tables = {
             row[0]
@@ -34,6 +34,7 @@ class TestInitDb:
             "positions",
             "transactions",
             "reservations",
+            "option_positions",
         }
 
     def test_idempotent_double_call(self, empty_conn):

@@ -10,8 +10,9 @@ from zoneinfo import ZoneInfo
 from nexus.audit import log_event
 from nexus.broker import AlpacaBroker
 from nexus.config import NexusConfig, get_audit_path
-from nexus.ledger import process_cancel, process_cancel_failed, process_cancel_pending
+from nexus.ledger import process_cancel, process_cancel_failed, process_cancel_pending, process_cancel_option
 from nexus.models import OrderStatus
+from nexus.occ import is_occ_symbol
 from nexus.sync import sync_outstanding_orders
 
 ET = ZoneInfo("America/New_York")
@@ -266,7 +267,11 @@ def _sync_cancellation_state(
                         state = broker.get_order(broker_order_id)
                         if state.status in CANCELLED_TERMINAL_STATES:
                             if not dry_run:
-                                process_cancel(conn, order_id)
+                                # Use option-aware cancel for option orders
+                                if is_occ_symbol(row["symbol"]):
+                                    process_cancel_option(conn, order_id)
+                                else:
+                                    process_cancel(conn, order_id)
                                 log_event(audit_path, {
                                     "event": "ghost_order_resolved",
                                     "order_id": order_id,
