@@ -96,13 +96,22 @@ def _check_alpaca_reachable(conn: sqlite3.Connection) -> DoctorCheck:
 
 
 def _check_no_orphaned_reservations(conn: sqlite3.Connection) -> DoctorCheck:
-    """Check for reservations tied to terminal orders."""
+    """Check for reservations tied to terminal orders.
+
+    Excludes reservations backed by an open option position
+    (origin_order_id in option_positions with qty > 0).
+    Matches the reconciler's cleanup logic.
+    """
     name = "no_orphaned_reservations"
     try:
         cursor = conn.execute(
             "SELECT COUNT(*) as cnt FROM reservations r "
             "JOIN orders o ON r.order_id = o.id "
-            "WHERE o.status IN ('filled','cancelled','expired')"
+            "WHERE o.status IN ('filled','cancelled','expired') "
+            "  AND r.order_id NOT IN ("
+            "    SELECT origin_order_id FROM option_positions "
+            "    WHERE origin_order_id IS NOT NULL AND qty > 0"
+            "  )"
         )
         count = cursor.fetchone()["cnt"]
         if count > 0:
@@ -139,12 +148,17 @@ def _check_no_stale_orders(conn: sqlite3.Connection) -> DoctorCheck:
 
 
 def _check_balance_consistent(conn: sqlite3.Connection) -> DoctorCheck:
-    """Compare strategy cash balances against transaction sums."""
+    """Compare strategy cash balances against transaction sums.
+    
+    Strategies start with $10,000 initial capital. The cash_balance should equal
+    10000 + sum(transactions).
+    """
     name = "balance_consistent"
     try:
         cursor = conn.execute("SELECT id, name, cash_balance FROM strategies")
         strategies = cursor.fetchall()
         inconsistent = []
+        INITIAL_CAPITAL = 10000.0
         for strat in strategies:
             tx_cursor = conn.execute(
                 "SELECT COALESCE(SUM(amount), 0) as total FROM transactions "
@@ -152,7 +166,8 @@ def _check_balance_consistent(conn: sqlite3.Connection) -> DoctorCheck:
                 (strat["id"],),
             )
             tx_total = tx_cursor.fetchone()["total"]
-            drift = abs(strat["cash_balance"] - tx_total)
+            expected_balance = INITIAL_CAPITAL + tx_total
+            drift = abs(strat["cash_balance"] - expected_balance)
             if drift > 0.01:
                 inconsistent.append(f"{strat['name']} (drift=${drift:.2f})")
         if inconsistent:

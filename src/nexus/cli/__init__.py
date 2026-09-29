@@ -189,7 +189,8 @@ def dashboard(
     strategy: str | None = typer.Option(None, "--strategy", "-s", help="Focus on a single strategy"),
     days: int = typer.Option(7, "--days", help="Lookback window in days for fills and transactions"),
     no_live: bool = typer.Option(False, "--no-live", help="Skip live Alpaca queries (use cached DB data only)"),
-    output: str | None = typer.Option(None, "--output", "-o", help="Output HTML path (default: alongside the database)"),
+    out: str | None = typer.Option(None, "--out", help="Write to this exact path (overrides config)"),
+    git_push: bool | None = typer.Option(None, "--git-push/--no-git-push", help="Force git publish on/off for this run (overrides config)"),
     no_open: bool = typer.Option(False, "--no-open", help="Generate without opening browser"),
 ) -> None:
     """Generate a status dashboard and open in browser."""
@@ -197,6 +198,7 @@ def dashboard(
 
     from nexus.config import load_config
     from nexus.dashboard import generate_dashboard
+    from nexus.git_publish import ArtifactGitError, publish_artifact_git
 
     if days < 1:
         if json_output({"error": "--days must be at least 1"}):
@@ -207,12 +209,12 @@ def dashboard(
     config = load_config()
 
     try:
-        out = generate_dashboard(
+        out_path = generate_dashboard(
             config,
             strategy=strategy,
             days=days,
             live=not no_live,
-            output=Path(output).expanduser() if output else None,
+            output=Path(out).expanduser() if out else None,
         )
     except ValueError as exc:
         if json_output({"error": str(exc)}):
@@ -225,17 +227,42 @@ def dashboard(
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
 
-    if json_output({"status": "ok", "path": str(out)}):
+    publish = git_push if git_push is not None else config.dashboard.git_enabled
+    git_result: dict | None = None
+    if publish:
+        try:
+            git_result = publish_artifact_git(out_path, config.dashboard.git_branch)
+        except ArtifactGitError as exc:
+            typer.echo(f"Warning: dashboard git publish failed: {exc}", err=True)
+            git_result = {
+                "committed": False,
+                "pushed": False,
+                "commit": None,
+                "branch": config.dashboard.git_branch,
+                "output": str(out_path),
+                "reason": str(exc),
+            }
+
+    payload: dict = {"status": "ok", "path": str(out_path)}
+    if git_result is not None:
+        payload["git"] = git_result
+
+    if json_output(payload):
         if not no_open:
             import webbrowser
 
-            webbrowser.open(out.as_uri())
+            webbrowser.open(out_path.as_uri())
         return
-    typer.echo(f"Dashboard: {out}")
+    typer.echo(f"Dashboard: {out_path}")
+    if git_result is not None:
+        if git_result.get("pushed"):
+            typer.echo(f"Git publish: committed {git_result.get('commit', '')[:8]}, pushed to {git_result.get('branch') or 'upstream'}")
+        elif git_result.get("reason"):
+            typer.echo(f"Git publish skipped: {git_result['reason']}")
     if not no_open:
         import webbrowser
 
-        webbrowser.open(out.as_uri())
+        webbrowser.open(out_path.as_uri())
 
 
 @app.command()

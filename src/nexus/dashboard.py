@@ -12,6 +12,23 @@ from nexus.config import NexusConfig, get_audit_path, get_db_path
 _CONTRACT_MULTIPLIER = 100
 _STALE_HOURS = 24
 _AUDIT_TAIL_LINES = 300
+_DEFAULT_OUT_FILE = "dashboard.html"
+
+
+def resolve_dashboard_path(cfg: NexusConfig, explicit: Path | None = None) -> Path:
+    """Resolve the dashboard output path.
+
+    Precedence: explicit CLI flag wins, then config-file settings
+    ([dashboard] out_dir/out_file), then the historical default
+    (dashboard.html alongside the database). Empty config values
+    fall back to the default.
+    """
+    if explicit is not None:
+        return explicit
+    out_dir = cfg.dashboard.out_dir.strip()
+    out_file = cfg.dashboard.out_file.strip() or _DEFAULT_OUT_FILE
+    base = Path(out_dir).expanduser() if out_dir else get_db_path(cfg).parent
+    return base / out_file
 
 
 def generate_dashboard(
@@ -34,7 +51,7 @@ def generate_dashboard(
 
     rendered = _render_html(data)
 
-    out = output if output is not None else get_db_path(cfg).parent / "dashboard.html"
+    out = output if output is not None else resolve_dashboard_path(cfg)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(rendered, encoding="utf-8")
     return out

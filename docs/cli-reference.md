@@ -1,6 +1,6 @@
 # Nexus CLI Reference
 
-Complete reference for all `nexus` commands. Version 0.4.0.
+Complete reference for all `nexus` commands. Version 0.5.0.
 
 ---
 
@@ -820,7 +820,9 @@ nexus --json doctor
 
 ### `nexus dashboard`
 
-Generate a self-contained HTML status dashboard and open it in the default browser. The page uses a dark theme with tabbed sections (Overview, Accounts & Strategies, Positions, Orders & Transactions, Health & System) covering portfolio state, live-vs-cached broker comparison, and ecosystem health. All CSS/JS is inlined — no network access needed to view the file. Output defaults to `~/.local/share/nexus/dashboard.html` (alongside the database).
+Generate a self-contained HTML status dashboard and open it in the default browser. The page uses a dark theme with tabbed sections (Overview, Accounts & Strategies, Positions, Orders & Transactions, Health & System) covering portfolio state, live-vs-cached broker comparison, and ecosystem health. All CSS/JS is inlined — no network access needed to view the file.
+
+Output path precedence: `--out` flag wins, then `[dashboard] out_dir`/`out_file` from the config file, then the default (`dashboard.html` alongside the database). Parent directories are created as needed.
 
 Live Alpaca data (account balances, prices, open/bypass orders) is queried per broker profile and degrades gracefully per profile on failure. Pass `--no-live` to skip network calls entirely.
 
@@ -833,14 +835,18 @@ Live Alpaca data (account balances, prices, open/bypass orders) is queried per b
 | `--strategy`, `-s` | str | None | Focus on a single strategy |
 | `--days` | int | `7` | Lookback window in days for fills and transactions |
 | `--no-live` | bool | `false` | Skip live Alpaca queries (use cached DB data only) |
-| `--output`, `-o` | str | None | Output HTML path (default: alongside the database) |
+| `--out` | str | None | Write to this exact path (overrides config) |
+| `--git-push` / `--no-git-push` | bool | (config `git_enabled`) | Force git publish on/off for this run |
 | `--no-open` | bool | `false` | Generate without opening browser |
+
+**Git publishing:** with `--git-push` (or `git_enabled = true` in `[dashboard]`), the file is committed (`Update <file> (<UTC timestamp>)`, only if changed) and pushed to `git_branch` (empty = current branch upstream). Only the artifact file is ever staged. Publishing is best-effort: failures warn on stderr but the command still exits 0. `--json` output includes the outcome under the `git` key. Git identity comes from the repo's own git config; authentication (ssh key/agent) is assumed working.
 
 **Example:**
 
 ```bash
 nexus dashboard
-nexus dashboard --no-open --no-live --output /tmp/nexus-dash.html
+nexus dashboard --no-open --no-live --out /tmp/nexus-dash.html
 nexus dashboard --strategy the_wheel --days 30 --no-open
+nexus dashboard --no-open --git-push
 nexus --json dashboard --no-open
 ```

@@ -128,16 +128,10 @@ class TestBalanceConsistent:
     @patch("nexus.doctor.get_schedule_status", return_value={"installed": False, "schedule": None, "command": None})
     @patch("subprocess.run")
     def test_balance_consistent_passes(self, mock_subprocess, mock_cron, conn, sample_strategy):
-        """Should pass when strategy balance matches transaction sum."""
+        """Should pass when strategy balance matches initial capital + transaction sum."""
         mock_subprocess.return_value = MagicMock(returncode=1, stdout="", stderr="error")
 
-        # Strategy has cash_balance=10000 from fixture; add a matching transaction
-        conn.execute(
-            "INSERT INTO transactions (strategy_id, type, amount, actor, created_at) VALUES (?, ?, ?, ?, ?)",
-            (sample_strategy, "deposit", 10000.0, "test", _now()),
-        )
-        conn.commit()
-
+        # Strategy has cash_balance=10000 from fixture; no transactions needed (initial capital)
         config = NexusConfig()
         checks = run_doctor(conn, config)
         check = _find_check(checks, "balance_consistent")
@@ -146,10 +140,16 @@ class TestBalanceConsistent:
     @patch("nexus.doctor.get_schedule_status", return_value={"installed": False, "schedule": None, "command": None})
     @patch("subprocess.run")
     def test_balance_consistent_fails(self, mock_subprocess, mock_cron, conn, sample_strategy):
-        """Should fail when strategy balance does not match transaction sum."""
+        """Should fail when strategy balance does not match initial capital + transaction sum."""
         mock_subprocess.return_value = MagicMock(returncode=1, stdout="", stderr="error")
 
-        # Strategy has cash_balance=10000 but no transactions -> drift of $10000
+        # Strategy has cash_balance=10000 but add a transaction that makes expected = 11000
+        conn.execute(
+            "INSERT INTO transactions (strategy_id, type, amount, actor, created_at) VALUES (?, ?, ?, ?, ?)",
+            (sample_strategy, "fill_buy", -1000.0, "test", _now()),
+        )
+        conn.commit()
+        # Expected balance = 10000 + (-1000) = 9000, but cash_balance is still 10000 -> drift of 1000
         config = NexusConfig()
         checks = run_doctor(conn, config)
         check = _find_check(checks, "balance_consistent")

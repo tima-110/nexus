@@ -13,7 +13,9 @@ and option orders (cash-secured puts, covered calls).
 - Run `pytest` before committing
 - CLI commands go in `src/nexus/cli/` as Typer sub-apps
 - All Alpaca interaction goes through `src/nexus/broker/alpaca.py` — nowhere else
-- Domain logic lives in dedicated modules (guards.py, ledger.py, reconciler.py)
+- Domain logic lives in dedicated modules (guards.py, ledger.py, reconciler.py, dashboard.py, git_publish.py)
+- Dashboard: keep `_collect_data()` / `_render_html()` split; single self-contained HTML file, no new deps
+- Git publish (`git_publish.py`): best-effort only — `ArtifactGitError` caught at CLI boundary, warn + exit 0; never stage anything but the artifact; no interactive git prompts ever
 - Every order state change must write a JSONL audit entry
 - Option order flow: `option-sell`/`option-buy` commands, OCC symbols, `option_positions` DB table
 - OCC symbol parsing lives in `src/nexus/occ.py`
@@ -28,6 +30,7 @@ pytest
 ```
 
 Tests mock the Alpaca CLI subprocess calls — never hit real APIs in tests.
+Git-publish tests use real temp repos (bare remote as origin), skipped if git is missing.
 
 ## Option Orders
 

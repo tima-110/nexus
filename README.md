@@ -76,6 +76,10 @@ nexus config path          # print config file location
 | `reconcile_interval` | `300` | Seconds between background reconciliation sweeps |
 | `audit_path` | `~/.local/share/nexus/audit.jsonl` | Path to audit log |
 | `db_path` | `~/.local/share/nexus/nexus.db` | Path to SQLite database |
+| `dashboard.out_dir` | `""` (dir containing the database) | Dashboard output directory |
+| `dashboard.out_file` | `dashboard.html` | Dashboard file name |
+| `dashboard.git_enabled` | `false` | Commit + push the dashboard to a git repo (opt-in) |
+| `dashboard.git_branch` | `""` (current branch) | Branch to push the dashboard to |
 
 ## Commands
 
@@ -92,9 +96,36 @@ nexus config path          # print config file location
 | `uninstall` | — | Remove background reconciler |
 | `status` | — | Show system health and sync state |
 | `doctor` | — | Diagnose common setup issues |
-| `dashboard` | `--strategy, --days, --no-live, --output, --no-open` | Generate self-contained HTML status dashboard (opens in browser by default) |
+| `dashboard` | `--strategy, --days, --no-live, --out, --git-push/--no-git-push, --no-open` | Generate self-contained HTML status dashboard (opens in browser by default) |
 
 See [docs/cli-reference.md](docs/cli-reference.md) for full command details.
+
+### Dashboard publishing
+
+Generate locally, or publish the dashboard into a git repo so status is
+visible across machines (e.g. a shared dashboards repo):
+
+```bash
+nexus dashboard --no-open                                  # local file only
+nexus dashboard --no-open --out ~/dashboards/dash.html     # exact path
+nexus dashboard --no-open --git-push                       # commit + push this run
+```
+
+Or opt in permanently via `~/.config/nexus/config.toml` (add the section
+on upgrades — fresh installs already include it):
+
+```toml
+[dashboard]
+out_dir = "~/dashboards"
+out_file = "dashboard-paper1.html"
+git_enabled = true
+git_branch = "main"
+```
+Git publishing is best-effort: a failed push warns on stderr but the command
+still exits 0 — the file on disk is the deliverable. If multiple machines
+share one repo, give each a distinct `dashboard.out_file`
+(e.g. `dashboard-paper1.html`) so pushes never contend on the same path.
+Schedule unattended runs externally, e.g. `0 6 * * * /path/to/nexus dashboard --no-open`.
 
 Nexus supports both equity and option orders. Option symbols use OCC
 format (e.g., `NKE260718P00040000`):
@@ -128,11 +159,18 @@ nexus --help
 
 ```
 src/nexus/
-  cli/          # Typer command groups
-  core/         # Domain logic (orders, strategies, positions)
-  broker/       # Alpaca CLI adapter
-  db/           # SQLite repository layer
-  config/       # TOML config loading + Pydantic models
+  cli/          # Typer command groups + top-level commands (reconcile, doctor, dashboard, ...)
+  broker/       # Alpaca CLI adapter (sole broker access point)
+  schedule/     # Cron install/status/uninstall for the reconciler
+  guards.py     # Pre-order validation (equity + option sell/buy guards)
+  ledger.py     # Reservations, fills, cancellations, balance mutations
+  sync.py       # Eager per-command order sync against the broker
+  reconciler.py # Background sweep: drift, orphans, ghosts, bypass orders
+  occ.py        # OCC option symbol parsing
+  dashboard.py  # Self-contained HTML status page (collect + render split)
+  git_publish.py # Best-effort git commit/push for the dashboard artifact
+  doctor.py     # Health checks
+  db.py / config.py / models.py / audit.py  # SQLite layer, TOML config, types, JSONL audit
 docs/           # Specification and reference docs
 tests/          # pytest suite
 ```

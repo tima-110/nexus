@@ -11,8 +11,8 @@ import pytest
 from typer.testing import CliRunner
 
 from nexus.cli import app
-from nexus.config import AuditLogConfig, NexusConfig
-from nexus.dashboard import _collect_data, _render_html, generate_dashboard
+from nexus.config import AuditLogConfig, DashboardConfig, DatabaseConfig, NexusConfig
+from nexus.dashboard import _collect_data, _render_html, generate_dashboard, resolve_dashboard_path
 from nexus.db import init_db
 
 runner = CliRunner()
@@ -184,6 +184,43 @@ class TestGenerateDashboard:
         assert out_path.exists()
         assert "Nexus Dashboard" in out_path.read_text(encoding="utf-8")
 
+    def test_config_out_dir_used(self, tmp_path):
+        conn = _setup_db()
+        cfg = NexusConfig(
+            audit_log=AuditLogConfig(path=str(tmp_path / "audit.jsonl")),
+            dashboard=DashboardConfig(out_dir=str(tmp_path / "pub"), out_file="dash.html"),
+        )
+        with patch("nexus.db.get_connection", return_value=conn), patch("nexus.db.init_db"):
+            out = generate_dashboard(cfg, days=7, live=False)
+        assert out == tmp_path / "pub" / "dash.html"
+        assert "Nexus Dashboard" in out.read_text(encoding="utf-8")
+
+
+class TestResolveDashboardPath:
+    def _cfg(self, tmp_path, **dash_kwargs):
+        return NexusConfig(
+            database=DatabaseConfig(path=str(tmp_path / "data" / "nexus.db")),
+            audit_log=AuditLogConfig(path=str(tmp_path / "audit.jsonl")),
+            dashboard=DashboardConfig(**dash_kwargs),
+        )
+
+    def test_default_is_beside_database(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        assert resolve_dashboard_path(cfg) == tmp_path / "data" / "dashboard.html"
+
+    def test_config_override(self, tmp_path):
+        cfg = self._cfg(tmp_path, out_dir=str(tmp_path / "pub"), out_file="mine.html")
+        assert resolve_dashboard_path(cfg) == tmp_path / "pub" / "mine.html"
+
+    def test_empty_out_file_falls_back(self, tmp_path):
+        cfg = self._cfg(tmp_path, out_dir=str(tmp_path / "pub"), out_file="  ")
+        assert resolve_dashboard_path(cfg) == tmp_path / "pub" / "dashboard.html"
+
+    def test_explicit_flag_wins(self, tmp_path):
+        cfg = self._cfg(tmp_path, out_dir=str(tmp_path / "pub"), out_file="mine.html")
+        explicit = tmp_path / "elsewhere" / "cli.html"
+        assert resolve_dashboard_path(cfg, explicit) == explicit
+
 
 class TestDashboardCli:
     def test_dashboard_smoke(self, tmp_path):
@@ -195,7 +232,7 @@ class TestDashboardCli:
              patch("nexus.db.init_db"), \
              patch("webbrowser.open") as mock_open:
             result = runner.invoke(app, [
-                "dashboard", "--no-open", "--no-live", "--output", str(out_path),
+                "dashboard", "--no-open", "--no-live", "--out", str(out_path),
             ])
         assert result.exit_code == 0, result.output
         assert "Dashboard:" in result.output
@@ -211,7 +248,7 @@ class TestDashboardCli:
              patch("nexus.db.init_db"), \
              patch("webbrowser.open") as mock_open:
             result = runner.invoke(app, [
-                "dashboard", "--no-live", "--output", str(out_path),
+                "dashboard", "--no-live", "--out", str(out_path),
             ])
         assert result.exit_code == 0, result.output
         mock_open.assert_called_once()
@@ -226,7 +263,7 @@ class TestDashboardCli:
              patch("nexus.db.init_db"), \
              patch("webbrowser.open"):
             result = runner.invoke(app, [
-                "--json", "dashboard", "--no-open", "--no-live", "--output", str(out_path),
+                "--json", "dashboard", "--no-open", "--no-live", "--out", str(out_path),
             ])
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
@@ -257,3 +294,107 @@ class TestDashboardCli:
         result = runner.invoke(app, ["dashboard", "--help"])
         assert result.exit_code == 0
         assert "--no-open" in result.output
+        assert "--out" in result.output
+        assert "--git-push" in result.output
+
+    def _invoke(self, conn, cfg, args):
+        with patch("nexus.config.load_config", return_value=cfg), \
+             patch("nexus.db.get_connection", return_value=conn), \
+             patch("nexus.db.init_db"), \
+             patch("webbrowser.open"):
+            return runner.invoke(app, args)
+
+    def test_default_run_does_not_publish(self, tmp_path):
+        conn = _setup_db()
+        out_path = tmp_path / "dashboard.html"
+        with patch("nexus.git_publish.publish_artifact_git") as mock_pub:
+            result = self._invoke(
+                conn, _test_config(tmp_path),
+                ["dashboard", "--no-open", "--no-live", "--out", str(out_path)],
+            )
+        assert result.exit_code == 0, result.output
+        mock_pub.assert_not_called()
+
+    def test_git_push_flag_invokes_helper(self, tmp_path):
+        from nexus.git_publish import ArtifactGitError  # noqa: F401 (re-export check)
+
+        conn = _setup_db()
+        out_path = tmp_path / "dashboard.html"
+        with patch("nexus.git_publish.publish_artifact_git") as mock_pub:
+            mock_pub.return_value = {
+                "committed": True, "pushed": True, "commit": "abc123",
+                "branch": "main", "output": str(out_path),
+            }
+            result = self._invoke(
+                conn, _test_config(tmp_path),
+                ["dashboard", "--no-open", "--no-live", "--out", str(out_path), "--git-push"],
+            )
+        assert result.exit_code == 0, result.output
+        mock_pub.assert_called_once()
+        assert "Git publish" in result.output
+
+    def test_config_git_enabled_publishes(self, tmp_path):
+        conn = _setup_db()
+        out_path = tmp_path / "dashboard.html"
+        cfg = NexusConfig(
+            audit_log=AuditLogConfig(path=str(tmp_path / "audit.jsonl")),
+            dashboard=DashboardConfig(git_enabled=True),
+        )
+        with patch("nexus.git_publish.publish_artifact_git") as mock_pub:
+            mock_pub.return_value = {
+                "committed": False, "pushed": False, "commit": None,
+                "branch": "main", "output": str(out_path), "reason": "no changes",
+            }
+            result = self._invoke(
+                conn, cfg,
+                ["dashboard", "--no-open", "--no-live", "--out", str(out_path)],
+            )
+        assert result.exit_code == 0, result.output
+        mock_pub.assert_called_once()
+
+    def test_no_git_push_overrides_config(self, tmp_path):
+        conn = _setup_db()
+        out_path = tmp_path / "dashboard.html"
+        cfg = NexusConfig(
+            audit_log=AuditLogConfig(path=str(tmp_path / "audit.jsonl")),
+            dashboard=DashboardConfig(git_enabled=True),
+        )
+        with patch("nexus.git_publish.publish_artifact_git") as mock_pub:
+            result = self._invoke(
+                conn, cfg,
+                ["dashboard", "--no-open", "--no-live", "--out", str(out_path), "--no-git-push"],
+            )
+        assert result.exit_code == 0, result.output
+        mock_pub.assert_not_called()
+
+    def test_git_failure_warns_and_succeeds(self, tmp_path):
+        from nexus.git_publish import ArtifactGitError
+
+        conn = _setup_db()
+        out_path = tmp_path / "dashboard.html"
+        with patch("nexus.git_publish.publish_artifact_git") as mock_pub:
+            mock_pub.side_effect = ArtifactGitError("remote hung up")
+            result = self._invoke(
+                conn, _test_config(tmp_path),
+                ["dashboard", "--no-open", "--no-live", "--out", str(out_path), "--git-push"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "Warning" in result.output
+        assert out_path.exists()
+
+    def test_git_outcome_in_json(self, tmp_path):
+        conn = _setup_db()
+        out_path = tmp_path / "dashboard.html"
+        with patch("nexus.git_publish.publish_artifact_git") as mock_pub:
+            mock_pub.return_value = {
+                "committed": True, "pushed": True, "commit": "abc123",
+                "branch": "main", "output": str(out_path),
+            }
+            result = self._invoke(
+                conn, _test_config(tmp_path),
+                ["--json", "dashboard", "--no-open", "--no-live",
+                 "--out", str(out_path), "--git-push"],
+            )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["git"]["pushed"] is True

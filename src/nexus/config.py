@@ -23,6 +23,12 @@ path = "~/.local/share/nexus/nexus.db"
 
 [audit_log]
 path = "~/.local/share/nexus/audit.jsonl"
+
+[dashboard]
+out_dir = ""
+out_file = "dashboard.html"
+git_enabled = false
+git_branch = ""
 """
 
 
@@ -44,11 +50,19 @@ class AuditLogConfig(BaseModel):
     path: str = "~/.local/share/nexus/audit.jsonl"
 
 
+class DashboardConfig(BaseModel):
+    out_dir: str = ""
+    out_file: str = "dashboard.html"
+    git_enabled: bool = False
+    git_branch: str = ""
+
+
 class NexusConfig(BaseModel):
     reconciler: ReconcilerConfig = Field(default_factory=ReconcilerConfig)
     order: OrderConfig = Field(default_factory=OrderConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     audit_log: AuditLogConfig = Field(default_factory=AuditLogConfig)
+    dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
 
 
 def _config_file_path() -> Path:

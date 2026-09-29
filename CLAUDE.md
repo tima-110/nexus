@@ -27,8 +27,15 @@ nexus --help               # verify CLI
 - **Eager sync**: every CLI command syncs outstanding orders for the calling strategy before
   proceeding, ensuring fresh state at decision time.
 - **Secrets via Alpaca CLI profiles**: no API keys stored by Nexus. Alpaca CLI manages auth.
+- **Dashboard is a static artifact**: `dashboard.py` keeps data collection (`_collect_data`)
+  separate from rendering (`_render_html`); single HTML file, inlined CSS/JS, no new deps.
+  Output path precedence: `--out` flag → `[dashboard]` config → default beside the DB.
+- **Git publishing is best-effort**: generation failure exits non-zero; publish failure
+  warns on stderr and still exits 0. One file in, one file committed; per-machine
+  `out_file` avoids push contention in the shared dashboards repo.
 - **Standard exceptions**: `ValueError` for validation, `RuntimeError` for API/network errors.
-  No custom hierarchy until module count warrants it.
+  One dedicated exception exists: `ArtifactGitError` for dashboard git-publish failures
+  (always caught at the CLI boundary — publish is best-effort, warn and exit 0).
 
 ## Architecture
 
