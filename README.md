@@ -92,6 +92,7 @@ nexus config path          # print config file location
 | `uninstall` | — | Remove background reconciler |
 | `status` | — | Show system health and sync state |
 | `doctor` | — | Diagnose common setup issues |
+| `dashboard` | `--strategy, --days, --no-live, --output, --no-open` | Generate self-contained HTML status dashboard (opens in browser by default) |
 
 See [docs/cli-reference.md](docs/cli-reference.md) for full command details.
 

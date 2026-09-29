@@ -1,6 +1,6 @@
 # Nexus CLI Reference
 
-Complete reference for all `nexus` commands. Version 0.3.0.
+Complete reference for all `nexus` commands. Version 0.4.0.
 
 ---
 
@@ -814,4 +814,33 @@ Run health checks on the Nexus system. Verifies database integrity, broker conne
 ```bash
 nexus doctor
 nexus --json doctor
+```
+
+---
+
+### `nexus dashboard`
+
+Generate a self-contained HTML status dashboard and open it in the default browser. The page uses a dark theme with tabbed sections (Overview, Accounts & Strategies, Positions, Orders & Transactions, Health & System) covering portfolio state, live-vs-cached broker comparison, and ecosystem health. All CSS/JS is inlined — no network access needed to view the file. Output defaults to `~/.local/share/nexus/dashboard.html` (alongside the database).
+
+Live Alpaca data (account balances, prices, open/bypass orders) is queried per broker profile and degrades gracefully per profile on failure. Pass `--no-live` to skip network calls entirely.
+
+**Synopsis:** `nexus dashboard [OPTIONS]`
+
+**Options:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--strategy`, `-s` | str | None | Focus on a single strategy |
+| `--days` | int | `7` | Lookback window in days for fills and transactions |
+| `--no-live` | bool | `false` | Skip live Alpaca queries (use cached DB data only) |
+| `--output`, `-o` | str | None | Output HTML path (default: alongside the database) |
+| `--no-open` | bool | `false` | Generate without opening browser |
+
+**Example:**
+
+```bash
+nexus dashboard
+nexus dashboard --no-open --no-live --output /tmp/nexus-dash.html
+nexus dashboard --strategy the_wheel --days 30 --no-open
+nexus --json dashboard --no-open
 ```

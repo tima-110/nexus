@@ -185,6 +185,60 @@ def status() -> None:
 
 
 @app.command()
+def dashboard(
+    strategy: str | None = typer.Option(None, "--strategy", "-s", help="Focus on a single strategy"),
+    days: int = typer.Option(7, "--days", help="Lookback window in days for fills and transactions"),
+    no_live: bool = typer.Option(False, "--no-live", help="Skip live Alpaca queries (use cached DB data only)"),
+    output: str | None = typer.Option(None, "--output", "-o", help="Output HTML path (default: alongside the database)"),
+    no_open: bool = typer.Option(False, "--no-open", help="Generate without opening browser"),
+) -> None:
+    """Generate a status dashboard and open in browser."""
+    from pathlib import Path
+
+    from nexus.config import load_config
+    from nexus.dashboard import generate_dashboard
+
+    if days < 1:
+        if json_output({"error": "--days must be at least 1"}):
+            raise typer.Exit(1)
+        typer.echo("Error: --days must be at least 1.", err=True)
+        raise typer.Exit(1)
+
+    config = load_config()
+
+    try:
+        out = generate_dashboard(
+            config,
+            strategy=strategy,
+            days=days,
+            live=not no_live,
+            output=Path(output).expanduser() if output else None,
+        )
+    except ValueError as exc:
+        if json_output({"error": str(exc)}):
+            raise typer.Exit(1)
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+    except RuntimeError as exc:
+        if json_output({"error": str(exc)}):
+            raise typer.Exit(1)
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+
+    if json_output({"status": "ok", "path": str(out)}):
+        if not no_open:
+            import webbrowser
+
+            webbrowser.open(out.as_uri())
+        return
+    typer.echo(f"Dashboard: {out}")
+    if not no_open:
+        import webbrowser
+
+        webbrowser.open(out.as_uri())
+
+
+@app.command()
 def doctor() -> None:
     """Run health checks on the Nexus system."""
     from nexus.config import load_config
