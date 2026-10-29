@@ -41,6 +41,8 @@ class AlpacaBroker:
             filled_avg_price=Decimal(str(filled_avg)) if filled_avg is not None else None,
             submitted_at=data["submitted_at"],
             filled_at=data.get("filled_at"),
+            order_class=data.get("order_class"),
+            legs=data.get("legs"),
         )
 
     def submit_order(
@@ -51,6 +53,25 @@ class AlpacaBroker:
         order_type: str,
         **params,
     ) -> BrokerOrder:
+        order_class = params.get("order_class")
+        if order_class == "oco":
+            body: dict = {
+                "symbol": symbol,
+                "qty": str(qty),
+                "side": side,
+                "type": order_type,
+                "time_in_force": params.get("time_in_force") or "gtc",
+                "order_class": "oco",
+            }
+            if "client_order_id" in params and params["client_order_id"]:
+                body["client_order_id"] = params["client_order_id"]
+            if params.get("take_profit") is not None:
+                body["take_profit"] = {"limit_price": str(params["take_profit"])}
+            if params.get("stop_loss") is not None:
+                body["stop_loss"] = {"stop_price": str(params["stop_loss"])}
+            data = self._run("api", "POST", "/v2/orders", "--body", json.dumps(body))
+            return self._order_from_dict(data)
+
         args = [
             "order", "submit",
             "--symbol", symbol,
@@ -58,7 +79,7 @@ class AlpacaBroker:
             "--side", side,
             "--type", order_type,
         ]
-        if "client_order_id" in params:
+        if "client_order_id" in params and params["client_order_id"]:
             args += ["--client-order-id", params["client_order_id"]]
         if params.get("limit_price") is not None:
             args += ["--limit-price", str(params["limit_price"])]
@@ -68,6 +89,12 @@ class AlpacaBroker:
             args += ["--trail-percent", str(params["trail_percent"])]
         if params.get("time_in_force") is not None:
             args += ["--time-in-force", params["time_in_force"]]
+        if order_class is not None and order_class != "simple":
+            args += ["--order-class", order_class]
+        if params.get("take_profit") is not None:
+            args += ["--take-profit", str(params["take_profit"])]
+        if params.get("stop_loss") is not None:
+            args += ["--stop-loss", str(params["stop_loss"])]
         data = self._run(*args)
         return self._order_from_dict(data)
 

@@ -55,6 +55,10 @@ def init_db(conn: sqlite3.Connection) -> None:
             trail_percent       REAL,
             time_in_force       TEXT,
             asset_class         TEXT    DEFAULT 'equity',
+            order_class         TEXT    DEFAULT 'simple',
+            take_profit_price   REAL,
+            stop_loss_price     REAL,
+            parent_order_id     INTEGER REFERENCES orders(id),
             status              TEXT    NOT NULL,
             client_order_id     TEXT    UNIQUE,
             broker_order_id     TEXT,
@@ -145,3 +149,31 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.commit()
     except Exception:
         pass  # column already exists
+
+    # Migration: add order_class to existing orders tables
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN order_class TEXT DEFAULT 'simple'")
+        conn.commit()
+    except Exception:
+        pass
+
+    # Migration: add take_profit_price to existing orders tables
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN take_profit_price REAL")
+        conn.commit()
+    except Exception:
+        pass
+
+    # Migration: add stop_loss_price to existing orders tables
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN stop_loss_price REAL")
+        conn.commit()
+    except Exception:
+        pass
+
+    # Migration: add parent_order_id to existing orders tables
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN parent_order_id INTEGER REFERENCES orders(id)")
+        conn.commit()
+    except Exception:
+        pass

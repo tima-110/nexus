@@ -16,6 +16,8 @@ class BrokerOrder:
     filled_avg_price: Decimal | None
     submitted_at: str
     filled_at: str | None
+    order_class: str | None = None
+    legs: list[dict] | None = None
 
 
 @dataclass

@@ -114,6 +114,9 @@ def order_buy(
     stop_price: float | None = typer.Option(None, "--stop-price"),
     trail_percent: float | None = typer.Option(None, "--trail-percent"),
     time_in_force: str | None = typer.Option(None, "--time-in-force", help="Time in force (day, gtc, ioc, fok)"),
+    order_class: str = typer.Option("simple", "--order-class", help="Order class (simple, bracket, oco)"),
+    take_profit: float | None = typer.Option(None, "--take-profit", help="Take-profit limit price"),
+    stop_loss: float | None = typer.Option(None, "--stop-loss", help="Stop-loss trigger price"),
     actor: str = typer.Option("cli:manual", "--actor"),
 ) -> None:
     """Place a buy order."""
@@ -161,11 +164,13 @@ def order_buy(
     cur = conn.execute(
         "INSERT INTO orders"
         " (strategy_id, symbol, side, qty, order_type, limit_price, stop_price, trail_percent,"
-        "  time_in_force, asset_class, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
-        " VALUES (?, ?, 'buy', ?, ?, ?, ?, ?, ?, 'equity', 'pending', ?, ?, 0, ?, ?, ?)",
+        "  time_in_force, asset_class, order_class, take_profit_price, stop_loss_price,"
+        "  status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+        " VALUES (?, ?, 'buy', ?, ?, ?, ?, ?, ?, 'equity', ?, ?, ?, 'pending', ?, ?, 0, ?, ?, ?)",
         (
             strategy_id, symbol, qty, order_type,
             limit_price, stop_price, trail_percent, time_in_force,
+            order_class, take_profit, stop_loss,
             client_order_id, estimated_cost,
             actor, now, now,
         ),
@@ -185,6 +190,9 @@ def order_buy(
             stop_price=stop_price,
             trail_percent=trail_percent,
             time_in_force=time_in_force,
+            order_class=order_class,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
         )
     except RuntimeError as exc:
         # Roll back: cancel order + release reservation
@@ -212,6 +220,9 @@ def order_buy(
         "symbol": symbol,
         "qty": qty,
         "order_type": order_type,
+        "order_class": order_class,
+        "take_profit": take_profit,
+        "stop_loss": stop_loss,
         "time_in_force": time_in_force,
         "client_order_id": client_order_id,
         "broker_order_id": result.broker_order_id,
@@ -234,6 +245,9 @@ def order_sell(
     stop_price: float | None = typer.Option(None, "--stop-price"),
     trail_percent: float | None = typer.Option(None, "--trail-percent"),
     time_in_force: str | None = typer.Option(None, "--time-in-force", help="Time in force (day, gtc, ioc, fok)"),
+    order_class: str = typer.Option("simple", "--order-class", help="Order class (simple, bracket, oco)"),
+    take_profit: float | None = typer.Option(None, "--take-profit", help="Take-profit limit price"),
+    stop_loss: float | None = typer.Option(None, "--stop-loss", help="Stop-loss trigger price"),
     actor: str = typer.Option("cli:manual", "--actor"),
 ) -> None:
     """Place a sell order."""
@@ -265,11 +279,13 @@ def order_sell(
     cur = conn.execute(
         "INSERT INTO orders"
         " (strategy_id, symbol, side, qty, order_type, limit_price, stop_price, trail_percent,"
-        "  time_in_force, asset_class, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
-        " VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?, 'equity', 'pending', ?, ?, 0, ?, ?, ?)",
+        "  time_in_force, asset_class, order_class, take_profit_price, stop_loss_price,"
+        "  status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
+        " VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?, 'equity', ?, ?, ?, 'pending', ?, ?, 0, ?, ?, ?)",
         (
             strategy_id, symbol, qty, order_type,
             limit_price, stop_price, trail_percent, time_in_force,
+            order_class, take_profit, stop_loss,
             client_order_id, float(qty),
             actor, now, now,
         ),
@@ -289,6 +305,9 @@ def order_sell(
             stop_price=stop_price,
             trail_percent=trail_percent,
             time_in_force=time_in_force,
+            order_class=order_class,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
         )
     except RuntimeError as exc:
         # Roll back: cancel order + release shares
@@ -318,6 +337,9 @@ def order_sell(
         "symbol": symbol,
         "qty": qty,
         "order_type": order_type,
+        "order_class": order_class,
+        "take_profit": take_profit,
+        "stop_loss": stop_loss,
         "time_in_force": time_in_force,
         "client_order_id": client_order_id,
         "broker_order_id": result.broker_order_id,
@@ -1015,13 +1037,15 @@ def order_list(
     order_type: OrderType | None = typer.Option(None, "--type", help="Filter by order type"),
     side: OrderSide | None = typer.Option(None, "--side", help="Filter by side"),
     asset_class: AssetClass | None = typer.Option(None, "--asset-class", help="Filter by asset class"),
+    order_class: str | None = typer.Option(None, "--order-class", help="Filter by order class"),
 ) -> None:
     """List orders with optional filters."""
     conn = get_connection()
     init_db(conn)
 
     query = (
-        "SELECT o.id, s.name AS strategy, o.symbol, o.side, o.qty, o.order_type,"
+        "SELECT o.id, s.name AS strategy, o.symbol, o.side, o.qty, o.order_type, o.order_class,"
+        "       o.take_profit_price, o.stop_loss_price,"
         "       o.time_in_force, o.status, o.client_order_id, o.filled_qty, o.created_at"
         " FROM orders o"
         " JOIN strategies s ON o.strategy_id = s.id"
@@ -1046,6 +1070,10 @@ def order_list(
         params.append(side)
     if asset_class is not None:
         query += " AND o.asset_class = ?"
+        params.append(asset_class)
+    if order_class is not None:
+        query += " AND o.order_class = ?"
+        params.append(order_class)
         params.append(asset_class.value)
 
     query += " ORDER BY o.id DESC"
