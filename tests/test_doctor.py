@@ -157,6 +157,75 @@ class TestBalanceConsistent:
         assert "drift" in check.detail
 
 
+class TestTimestampsIso:
+    @patch("nexus.doctor.get_schedule_status", return_value={"installed": False, "schedule": None, "command": None})
+    @patch("subprocess.run")
+    def test_timestamps_iso_passes_clean(self, mock_subprocess, mock_cron, conn, sample_strategy):
+        """Should pass when all timestamps are tz-aware ISO 8601."""
+        mock_subprocess.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+
+        config = NexusConfig()
+        checks = run_doctor(conn, config)
+        check = _find_check(checks, "timestamps_iso")
+        assert check.passed is True
+        assert "all timestamps tz-aware ISO" in check.detail
+
+    @patch("nexus.doctor.get_schedule_status", return_value={"installed": False, "schedule": None, "command": None})
+    @patch("subprocess.run")
+    def test_timestamps_iso_fails_naive(self, mock_subprocess, mock_cron, conn, sample_strategy):
+        """Should fail when a timestamp is naive (space-separated, no tz)."""
+        mock_subprocess.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+
+        conn.execute(
+            "INSERT INTO transactions (strategy_id, type, amount, actor, created_at) VALUES (?, ?, ?, ?, ?)",
+            (sample_strategy, "deposit", 15000.0, "cli:manual", "2026-10-21 15:16:49"),
+        )
+        conn.commit()
+
+        config = NexusConfig()
+        checks = run_doctor(conn, config)
+        check = _find_check(checks, "timestamps_iso")
+        assert check.passed is False
+        assert "transactions.created_at (1)" in check.detail
+
+    @patch("nexus.doctor.get_schedule_status", return_value={"installed": False, "schedule": None, "command": None})
+    @patch("subprocess.run")
+    def test_timestamps_iso_fails_missing_tz(self, mock_subprocess, mock_cron, conn, sample_strategy):
+        """Should fail when a timestamp has 'T' but lacks timezone offset."""
+        mock_subprocess.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+
+        conn.execute(
+            "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status, "
+            "client_order_id, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (sample_strategy, "AAPL", "buy", 10, "market", "submitted", "nx-tz-1", "test", "2026-10-21T15:16:49"),
+        )
+        conn.commit()
+
+        config = NexusConfig()
+        checks = run_doctor(conn, config)
+        check = _find_check(checks, "timestamps_iso")
+        assert check.passed is False
+        assert "orders.created_at (1)" in check.detail
+
+    @patch("nexus.doctor.get_schedule_status", return_value={"installed": False, "schedule": None, "command": None})
+    @patch("subprocess.run")
+    def test_timestamps_iso_handles_null(self, mock_subprocess, mock_cron, conn, sample_strategy):
+        """Should ignore NULL timestamp values and pass."""
+        mock_subprocess.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+
+        conn.execute(
+            "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status, "
+            "client_order_id, actor, created_at, filled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (sample_strategy, "AAPL", "buy", 10, "market", "submitted", "nx-null-1", "test", _now(), None),
+        )
+        conn.commit()
+
+        config = NexusConfig()
+        checks = run_doctor(conn, config)
+        check = _find_check(checks, "timestamps_iso")
+        assert check.passed is True
+
+
 class TestCronCheck:
     @patch("nexus.doctor.get_schedule_status")
     @patch("subprocess.run")

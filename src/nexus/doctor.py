@@ -27,6 +27,7 @@ def run_doctor(conn: sqlite3.Connection, config: NexusConfig) -> list[DoctorChec
     checks.append(_check_no_orphaned_reservations(conn))
     checks.append(_check_no_stale_orders(conn))
     checks.append(_check_balance_consistent(conn))
+    checks.append(_check_timestamps_iso(conn))
     checks.append(_check_audit_writable(config))
     checks.append(_check_cron_installed())
     return checks
@@ -177,6 +178,40 @@ def _check_balance_consistent(conn: sqlite3.Connection) -> DoctorCheck:
                 detail=f"inconsistent: {', '.join(inconsistent)}",
             )
         return DoctorCheck(name=name, passed=True, detail="all balances consistent")
+    except Exception as e:
+        return DoctorCheck(name=name, passed=False, detail=str(e))
+
+
+def _check_timestamps_iso(conn: sqlite3.Connection) -> DoctorCheck:
+    """Verify all timestamp columns across all tables use tz-aware ISO 8601 formatting."""
+    name = "timestamps_iso"
+    try:
+        cursor = conn.execute(
+            "SELECT m.name AS tbl, p.name AS col "
+            "FROM sqlite_master m "
+            "JOIN pragma_table_info(m.name) p "
+            "WHERE m.type = 'table' "
+            "  AND (p.name LIKE '%_at' OR p.name IN ('timestamp', 'created_at', 'updated_at', 'filled_at', 'opened_at', 'last_synced_at')) "
+            "ORDER BY m.name, p.name"
+        )
+        failures = []
+        for row in cursor.fetchall():
+            tbl, col = row[0], row[1]
+            cnt_cur = conn.execute(
+                f'SELECT COUNT(*) AS cnt FROM "{tbl}" '
+                f'WHERE "{col}" IS NOT NULL '
+                f'  AND ("{col}" NOT LIKE \'%T%+00:00\' AND "{col}" NOT LIKE \'%T%Z\')'
+            )
+            cnt = cnt_cur.fetchone()[0]
+            if cnt > 0:
+                failures.append(f"{tbl}.{col} ({cnt})")
+        if failures:
+            return DoctorCheck(
+                name=name,
+                passed=False,
+                detail=f"non-ISO timestamps found: {', '.join(failures)}",
+            )
+        return DoctorCheck(name=name, passed=True, detail="all timestamps tz-aware ISO")
     except Exception as e:
         return DoctorCheck(name=name, passed=False, detail=str(e))
 
