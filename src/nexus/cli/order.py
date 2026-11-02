@@ -104,6 +104,60 @@ def _emit_ghost_hint(exc: RuntimeError, broker: AlpacaBroker, symbol: str, err_p
     )
 
 
+def _record_order_legs(
+    conn: sqlite3.Connection,
+    parent_order_id: int,
+    strategy_id: int,
+    symbol: str,
+    parent_side: str,
+    parent_qty: int,
+    order_class: str,
+    actor: str,
+    time_in_force: str | None,
+    legs: list[dict] | None,
+) -> None:
+    """Store child bracket/oco legs in the orders table."""
+    if not legs:
+        return
+    now = _now()
+    for leg in legs:
+        leg_broker_id = leg.get("id")
+        leg_client_id = leg.get("client_order_id")
+        leg_side = leg.get("side") or ("sell" if parent_side == "buy" else "buy")
+        leg_qty = int(leg.get("qty") or parent_qty)
+        leg_type = leg.get("order_type") or leg.get("type") or "limit"
+        leg_limit = float(leg["limit_price"]) if leg.get("limit_price") is not None else None
+        leg_stop = float(leg["stop_price"]) if leg.get("stop_price") is not None else None
+        leg_status = leg.get("status") or "held"
+        leg_tif = leg.get("time_in_force") or time_in_force or "gtc"
+
+        existing = None
+        if leg_broker_id:
+            existing = conn.execute(
+                "SELECT id FROM orders WHERE broker_order_id = ?", (leg_broker_id,)
+            ).fetchone()
+        if existing is None and leg_client_id:
+            existing = conn.execute(
+                "SELECT id FROM orders WHERE client_order_id = ?", (leg_client_id,)
+            ).fetchone()
+
+        if existing is None:
+            conn.execute(
+                "INSERT INTO orders ("
+                "  strategy_id, symbol, side, qty, order_type, limit_price, stop_price,"
+                "  time_in_force, asset_class, order_class, status, client_order_id,"
+                "  broker_order_id, parent_order_id, actor, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'equity', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    strategy_id, symbol, leg_side, leg_qty, leg_type,
+                    leg_limit, leg_stop, leg_tif, order_class,
+                    leg_status, leg_client_id, leg_broker_id, parent_order_id,
+                    actor, now, now,
+                ),
+            )
+    conn.commit()
+
+
 @order_app.command("buy")
 def order_buy(
     symbol: str = typer.Argument(..., help="Ticker symbol"),
@@ -212,6 +266,12 @@ def order_buy(
         (result.broker_order_id, _now(), order_id),
     )
     conn.commit()
+
+    # Record child legs if present
+    if result.legs:
+        _record_order_legs(
+            conn, order_id, strategy_id, symbol, "buy", qty, order_class, actor, time_in_force, result.legs
+        )
 
     log_event(audit_path, {
         "event": "order_submitted",
@@ -329,6 +389,12 @@ def order_sell(
         (result.broker_order_id, _now(), order_id),
     )
     conn.commit()
+
+    # Record child legs if present
+    if result.legs:
+        _record_order_legs(
+            conn, order_id, strategy_id, symbol, "sell", qty, order_class, actor, time_in_force, result.legs
+        )
 
     log_event(audit_path, {
         "event": "order_submitted",

@@ -203,3 +203,10 @@ class TestCliMultiLegCommands:
         assert "165.0" in args
         assert "--stop-loss" in args
         assert "145.0" in args
+
+        # Verify child legs were inserted into orders table
+        legs = conn.execute("SELECT * FROM orders WHERE parent_order_id = ?", (order_id,)).fetchall()
+        assert len(legs) == 2
+        broker_ids = {l["broker_order_id"] for l in legs}
+        assert "leg-tp-1" in broker_ids
+        assert "leg-sl-1" in broker_ids

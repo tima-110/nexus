@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from nexus.audit import log_event
 from nexus.broker import AlpacaBroker
 from nexus.config import NexusConfig, get_audit_path
-from nexus.ledger import process_cancel, process_cancel_failed, process_cancel_pending, process_cancel_option
+from nexus.ledger import process_cancel, process_cancel_failed, process_cancel_pending, process_cancel_option, process_fill
 from nexus.models import OrderStatus
 from nexus.occ import is_occ_symbol
 from nexus.sync import sync_outstanding_orders
@@ -156,6 +156,139 @@ def _sync_position_prices(
                 conn.commit()
         except RuntimeError as e:
             result.errors.append(f"position_price_sync({row['profile_name']}): {e}")
+
+
+def _sync_unrecorded_broker_fills(
+    conn: sqlite3.Connection,
+    result: ReconcileResult,
+    dry_run: bool,
+    strategy_name: str | None = None,
+) -> None:
+    """Step 3c-1: Detect and ingest fills and closed legs executed on the broker that are missing from orders."""
+    if strategy_name is not None:
+        rows = conn.execute(
+            "SELECT s.id AS strategy_id, s.name AS strategy_name, ba.id AS broker_account_id, ba.profile_name "
+            "FROM strategies s JOIN broker_accounts ba ON s.broker_account_id = ba.id "
+            "WHERE s.is_active = 1 AND s.name = ?",
+            (strategy_name,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT s.id AS strategy_id, s.name AS strategy_name, ba.id AS broker_account_id, ba.profile_name "
+            "FROM strategies s JOIN broker_accounts ba ON s.broker_account_id = ba.id "
+            "WHERE s.is_active = 1"
+        ).fetchall()
+
+    processed_profiles: set[str] = set()
+    for row in rows:
+        profile_name = row["profile_name"]
+        if profile_name in processed_profiles:
+            continue
+        processed_profiles.add(profile_name)
+
+        try:
+            broker = AlpacaBroker(profile_name)
+            closed_orders = broker.list_orders(status="closed")
+            for bo in closed_orders:
+                existing = None
+                if bo.broker_order_id:
+                    existing = conn.execute(
+                        "SELECT id, status, filled_qty FROM orders WHERE broker_order_id = ?",
+                        (bo.broker_order_id,),
+                    ).fetchone()
+                if existing is None and bo.client_order_id:
+                    existing = conn.execute(
+                        "SELECT id, status, filled_qty FROM orders WHERE client_order_id = ?",
+                        (bo.client_order_id,),
+                    ).fetchone()
+
+                if existing is not None:
+                    # If exists in DB but broker shows filled and DB has not recorded fill/transaction
+                    if bo.status == OrderStatus.filled and bo.filled_qty and (existing["status"] != OrderStatus.filled or not existing["filled_qty"]):
+                        if not dry_run:
+                            filled_at = bo.filled_at or datetime.now(timezone.utc).isoformat()
+                            filled_avg = float(bo.filled_avg_price or 0.0)
+                            process_fill(conn, existing["id"], bo.filled_qty, filled_avg, filled_at)
+                            result.orders_synced += 1
+                    continue
+
+                if bo.status != OrderStatus.filled and bo.status not in CANCELLED_TERMINAL_STATES:
+                    continue
+
+                # Determine strategy_id
+                strat_id: int | None = None
+                cid = bo.client_order_id or ""
+                if cid.startswith("ww-"):
+                    s_row = conn.execute("SELECT id FROM strategies WHERE name = 'whale_walk'").fetchone()
+                    if s_row:
+                        strat_id = s_row["id"]
+                elif cid.startswith("nx-"):
+                    parts = cid.split("-")
+                    if len(parts) >= 2:
+                        prefix = parts[1]
+                        s_row = conn.execute("SELECT id FROM strategies WHERE name LIKE ?", (f"{prefix}%",)).fetchone()
+                        if s_row:
+                            strat_id = s_row["id"]
+
+                parent_order_id: int | None = None
+                if strat_id is None:
+                    cand = conn.execute(
+                        "SELECT id, strategy_id FROM orders WHERE symbol = ? AND strategy_id IN ("
+                        "SELECT id FROM strategies WHERE broker_account_id = (SELECT id FROM broker_accounts WHERE profile_name = ?)"
+                        ") ORDER BY id DESC LIMIT 1",
+                        (bo.symbol, profile_name),
+                    ).fetchone()
+                    if cand:
+                        strat_id = cand["strategy_id"]
+                        parent_order_id = cand["id"]
+                else:
+                    cand = conn.execute(
+                        "SELECT id FROM orders WHERE symbol = ? AND strategy_id = ? AND side != ? ORDER BY id DESC LIMIT 1",
+                        (bo.symbol, strat_id, bo.side),
+                    ).fetchone()
+                    if cand:
+                        parent_order_id = cand["id"]
+
+                if strat_id is None:
+                    continue
+
+                if dry_run:
+                    result.orders_synced += 1
+                    continue
+
+                now_iso = datetime.now(timezone.utc).isoformat()
+                submitted_at = bo.submitted_at or now_iso
+
+                if bo.status == OrderStatus.filled and bo.filled_qty:
+                    filled_at = bo.filled_at or now_iso
+                    filled_avg = float(bo.filled_avg_price or 0.0)
+                    cur = conn.execute(
+                        "INSERT INTO orders ("
+                        "  strategy_id, symbol, side, qty, order_type, status, client_order_id,"
+                        "  broker_order_id, parent_order_id, time_in_force, order_class,"
+                        "  asset_class, filled_qty, filled_avg_price, filled_at, actor, created_at, updated_at"
+                        ") VALUES (?, ?, ?, ?, 'limit', 'submitted', ?, ?, ?, 'gtc', 'bracket', 'equity', 0, 0, NULL, 'system:reconciler', ?, ?)",
+                        (strat_id, bo.symbol, bo.side, bo.qty, bo.client_order_id, bo.broker_order_id, parent_order_id, submitted_at, now_iso),
+                    )
+                    new_order_id = cur.lastrowid
+                    conn.commit()
+                    process_fill(conn, new_order_id, bo.filled_qty, filled_avg, filled_at)
+                    result.orders_synced += 1
+
+                elif bo.status in CANCELLED_TERMINAL_STATES and parent_order_id is not None:
+                    # Ingest canceled leg for complete blotter audit
+                    conn.execute(
+                        "INSERT INTO orders ("
+                        "  strategy_id, symbol, side, qty, order_type, status, client_order_id,"
+                        "  broker_order_id, parent_order_id, time_in_force, order_class,"
+                        "  asset_class, filled_qty, filled_avg_price, filled_at, actor, created_at, updated_at"
+                        ") VALUES (?, ?, ?, ?, 'limit', 'cancelled', ?, ?, ?, 'gtc', 'bracket', 'equity', 0, NULL, NULL, 'system:reconciler', ?, ?)",
+                        (strat_id, bo.symbol, bo.side, bo.qty, bo.client_order_id, bo.broker_order_id, parent_order_id, submitted_at, now_iso),
+                    )
+                    conn.commit()
+
+        except RuntimeError as e:
+            result.errors.append(f"unrecorded_fills_sync({profile_name}): {e}")
 
 
 def _sync_broker_positions(
@@ -445,6 +578,9 @@ def run_reconcile(
 
     # Step 3b: Sync NULL avg_entry_price from broker (always runs)
     _sync_position_prices(conn, result, dry_run)
+
+    # Step 3c-1: Ingest unrecorded broker fills / child legs (always runs)
+    _sync_unrecorded_broker_fills(conn, result, dry_run, strategy_name=strategy_name)
 
     # Step 3c: Reconcile closed positions against broker ground truth (always runs)
     _sync_broker_positions(conn, result, dry_run, strategy_name=strategy_name)
