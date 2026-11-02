@@ -74,7 +74,7 @@ def sync_outstanding_orders(
             else:
                 process_fill(conn, order_id, broker_order.filled_qty, filled_avg_price, filled_at)
 
-        elif broker_status in (OrderStatus.cancelled, OrderStatus.expired):
+        elif broker_status in (OrderStatus.cancelled, OrderStatus.expired, "replaced", "canceled"):
             if is_option:
                 process_cancel_option(conn, order_id)
             else:

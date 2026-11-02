@@ -133,7 +133,8 @@ def _check_no_stale_orders(conn: sqlite3.Connection) -> DoctorCheck:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         cursor = conn.execute(
             "SELECT COUNT(*) as cnt FROM orders "
-            "WHERE status = 'submitted' AND created_at < ?",
+            "WHERE status = 'submitted' AND created_at < ? "
+            "  AND NOT (LOWER(COALESCE(time_in_force, '')) = 'gtc' AND order_type IN ('stop', 'trailing_stop', 'limit'))",
             (cutoff,),
         )
         count = cursor.fetchone()["cnt"]

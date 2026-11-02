@@ -158,6 +158,55 @@ def _sync_position_prices(
             result.errors.append(f"position_price_sync({row['profile_name']}): {e}")
 
 
+def _sync_broker_positions(
+    conn: sqlite3.Connection,
+    result: ReconcileResult,
+    dry_run: bool,
+    strategy_name: str | None = None,
+) -> None:
+    """Step 3c: Reconcile local positions against broker ground truth.
+    If a position exists in Nexus but the broker reports 0 shares / no position, remove it."""
+    if strategy_name is not None:
+        rows = conn.execute(
+            "SELECT s.id AS strategy_id, s.name AS strategy_name, ba.profile_name "
+            "FROM strategies s JOIN broker_accounts ba ON s.broker_account_id = ba.id "
+            "WHERE s.is_active = 1 AND s.name = ?",
+            (strategy_name,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT s.id AS strategy_id, s.name AS strategy_name, ba.profile_name "
+            "FROM strategies s JOIN broker_accounts ba ON s.broker_account_id = ba.id "
+            "WHERE s.is_active = 1"
+        ).fetchall()
+
+    for row in rows:
+        strategy_id = row["strategy_id"]
+        profile_name = row["profile_name"]
+        try:
+            broker = AlpacaBroker(profile_name)
+            broker_positions = {p.symbol: p for p in broker.get_positions()}
+            local_positions = conn.execute(
+                "SELECT id, symbol, qty FROM positions WHERE strategy_id = ?",
+                (strategy_id,),
+            ).fetchall()
+            for lp in local_positions:
+                sym = lp["symbol"]
+                bp = broker_positions.get(sym)
+                if bp is None or float(bp.qty) == 0.0:
+                    if not dry_run:
+                        conn.execute("DELETE FROM positions WHERE id = ?", (lp["id"],))
+                        conn.execute(
+                            "DELETE FROM reservations WHERE order_id IN ("
+                            "SELECT id FROM orders WHERE strategy_id = ? AND symbol = ?)",
+                            (strategy_id, sym),
+                        )
+                        conn.commit()
+                        result.positions_synced += 1
+        except RuntimeError as e:
+            result.errors.append(f"broker_position_sync({profile_name}): {e}")
+
+
 def _cleanup_orphan_reservations(
     conn: sqlite3.Connection, result: ReconcileResult, dry_run: bool
 ) -> None:
@@ -396,6 +445,9 @@ def run_reconcile(
 
     # Step 3b: Sync NULL avg_entry_price from broker (always runs)
     _sync_position_prices(conn, result, dry_run)
+
+    # Step 3c: Reconcile closed positions against broker ground truth (always runs)
+    _sync_broker_positions(conn, result, dry_run, strategy_name=strategy_name)
 
     # Step 4: Orphan cleanup (skip outside market hours if configured)
     if not outside_market:
