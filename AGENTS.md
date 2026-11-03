@@ -43,3 +43,10 @@ Git-publish tests use real temp repos (bare remote as origin), skipped if git is
 
 OCC format: `ROOT (1-6 chars) + YYMMDD + C/P + 8-digit strike × 1000`
 Example: `NKE260718P00040000` = NKE, 2026-07-18, Put, $40.00 strike
+
+---
+
+## Hindsight Semantic Memory
+* This repository routes to the **`server-ops-mem`** bank via `~/.hindsight/coding-agent.json`.
+* Sessions in `~/projects/nexus` automatically retain settled architectural decisions, execution gateway contracts, and guard behaviors to `server-ops-mem`.
+
