@@ -3,17 +3,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
-from decimal import Decimal
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
-
-import pytest
-from typer.testing import CliRunner
 
 from nexus.broker.alpaca import AlpacaBroker
 from nexus.broker.types import BrokerOrder
 from nexus.cli import app
 from nexus.db import init_db
+from typer.testing import CliRunner
 
 runner = CliRunner()
 
@@ -50,7 +47,7 @@ def _setup_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     init_db(conn)
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     conn.execute(
         "INSERT INTO broker_accounts (profile_name, margin_multiplier, cash_balance) VALUES (?, ?, ?)",
         ("champion", 2.0, 100000.0),
@@ -210,3 +207,87 @@ class TestCliMultiLegCommands:
         broker_ids = {l["broker_order_id"] for l in legs}
         assert "leg-tp-1" in broker_ids
         assert "leg-sl-1" in broker_ids
+
+    @patch("nexus.cli.order.sync_outstanding_orders")
+    @patch("nexus.cli.order.get_connection")
+    @patch("subprocess.run")
+    def test_cli_sell_short_bracket_and_buy_short_cover(
+        self, mock_subprocess, mock_conn, mock_sync
+    ):
+        conn = _setup_conn()
+        mock_conn.return_value = conn
+        mock_sync.return_value = None
+        short_resp = _broker_order_response(
+            broker_id="broker-short-gs-1",
+            client_order_id="nx-test-GS-00000001",
+            symbol="GS",
+            side="sell",
+            qty=4,
+            order_class="bracket",
+        )
+        short_resp["legs"] = [
+            {"id": "leg-short-tp", "side": "buy", "order_type": "limit", "limit_price": "912.72"},
+            {"id": "leg-short-sl", "side": "buy", "order_type": "stop", "stop_price": "945.74"},
+        ]
+        mock_subprocess.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps(short_resp),
+            stderr="",
+        )
+
+        # 1. Without --short, selling GS with no position is blocked
+        blocked_res = runner.invoke(
+            app,
+            [
+                "--json",
+                "order",
+                "sell",
+                "GS",
+                "4",
+                "--strategy",
+                "test_strat",
+                "--type",
+                "limit",
+                "--limit-price",
+                "933.34",
+            ],
+        )
+        assert blocked_res.exit_code == 1
+        assert "no position" in json.loads(blocked_res.output.splitlines()[0])["error"].lower()
+
+        # 2. With --short, selling GS opens a short bracket order and reserves cash
+        res = runner.invoke(
+            app,
+            [
+                "--json",
+                "order",
+                "sell",
+                "GS",
+                "4",
+                "--short",
+                "--strategy",
+                "test_strat",
+                "--type",
+                "limit",
+                "--limit-price",
+                "933.34",
+                "--order-class",
+                "bracket",
+                "--take-profit",
+                "912.72",
+                "--stop-loss",
+                "945.74",
+                "--time-in-force",
+                "gtc",
+            ],
+        )
+        assert res.exit_code == 0
+        data = json.loads(res.output)
+        assert data["status"] == "ok"
+        order_id = data["order_id"]
+
+        legs = conn.execute(
+            "SELECT * FROM orders WHERE parent_order_id = ?", (order_id,)
+        ).fetchall()
+        assert len(legs) == 2
+        assert all(l["side"] == "buy" for l in legs)

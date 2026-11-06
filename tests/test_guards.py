@@ -1,15 +1,13 @@
 """Tests for nexus.guards — pre-order validation logic."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
-import pytest
+from datetime import UTC, datetime
 
 from nexus.guards import check_buy_guard, check_sell_guard
 
 
 def _insert_order(conn, strategy_id, symbol="AAPL", side="buy", status="submitted"):
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     cur = conn.execute(
         "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -20,7 +18,7 @@ def _insert_order(conn, strategy_id, symbol="AAPL", side="buy", status="submitte
 
 
 def _insert_position(conn, strategy_id, symbol="AAPL", qty=100, reserved_qty=0):
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     conn.execute(
         "INSERT INTO positions (strategy_id, symbol, qty, reserved_qty, avg_entry_price, "
         "opened_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -30,7 +28,7 @@ def _insert_position(conn, strategy_id, symbol="AAPL", qty=100, reserved_qty=0):
 
 
 def _insert_reservation(conn, strategy_id, order_id, amount):
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     conn.execute(
         "INSERT INTO reservations (strategy_id, order_id, amount, created_at) VALUES (?, ?, ?, ?)",
         (strategy_id, order_id, amount, now),
@@ -106,7 +104,7 @@ class TestSellGuard:
 
     def test_fail_zero_qty_position_treated_as_no_position(self, conn, sample_strategy):
         # Guard queries qty > 0 so a row with qty=0 should fail as "no position"
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute(
             "INSERT INTO positions (strategy_id, symbol, qty, reserved_qty, avg_entry_price, "
             "opened_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -116,3 +114,50 @@ class TestSellGuard:
         ok, reason = check_sell_guard(conn, sample_strategy, "AAPL", 1)
         assert ok is False
         assert "no position" in reason.lower()
+
+
+class TestShortGuards:
+    def test_sell_short_passes_with_no_position_and_sufficient_balance(self, conn, sample_strategy):
+        ok, reason = check_sell_guard(
+            conn, sample_strategy, "GS", 4, short=True, estimated_cost=3600.0
+        )
+        assert ok is True
+        assert reason == ""
+
+    def test_sell_short_blocked_if_already_holding_position(self, conn, sample_strategy):
+        _insert_position(conn, sample_strategy, "GS", qty=-4, reserved_qty=0)
+        ok, reason = check_sell_guard(
+            conn, sample_strategy, "GS", 4, short=True, estimated_cost=3600.0
+        )
+        assert ok is False
+        assert "already holding" in reason.lower()
+
+    def test_sell_short_blocked_if_insufficient_buying_power(self, conn, sample_strategy):
+        ok, reason = check_sell_guard(
+            conn, sample_strategy, "GS", 50, short=True, estimated_cost=45000.0
+        )
+        assert ok is False
+        assert "insufficient" in reason.lower()
+
+    def test_buy_to_cover_passes_when_short_position_exists(self, conn, sample_strategy):
+        _insert_position(conn, sample_strategy, "GS", qty=-4, reserved_qty=0)
+        ok, reason = check_buy_guard(
+            conn, sample_strategy, "GS", 0.0, short=True, qty=4
+        )
+        assert ok is True
+        assert reason == ""
+
+    def test_buy_to_cover_blocked_when_no_short_position(self, conn, sample_strategy):
+        ok, reason = check_buy_guard(
+            conn, sample_strategy, "GS", 0.0, short=True, qty=4
+        )
+        assert ok is False
+        assert "no short position" in reason.lower()
+
+    def test_buy_to_cover_blocked_on_double_cover(self, conn, sample_strategy):
+        _insert_position(conn, sample_strategy, "GS", qty=-4, reserved_qty=4)
+        ok, reason = check_buy_guard(
+            conn, sample_strategy, "GS", 0.0, short=True, qty=4
+        )
+        assert ok is False
+        assert "insufficient" in reason.lower()

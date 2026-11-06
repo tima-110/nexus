@@ -1,7 +1,8 @@
 """Order commands: buy, sell, close, cancel, status, list."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import sqlite3
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import typer
@@ -9,13 +10,12 @@ import typer
 from nexus.audit import log_event
 from nexus.broker import AlpacaBroker
 from nexus.cli import json_output
-from nexus.config import load_config, get_audit_path
+from nexus.config import get_audit_path, load_config
 from nexus.db import get_connection, init_db
 from nexus.guards import check_buy_guard, check_option_sell_guard, check_sell_guard
 from nexus.ledger import (
     create_reservation,
     process_cancel,
-    process_cancel_failed,
     process_cancel_pending,
     release_reservation,
     release_shares,
@@ -29,7 +29,7 @@ order_app = typer.Typer(name="order", no_args_is_help=True)
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _lookup_strategy(conn, strategy_name: str) -> dict:
@@ -171,9 +171,10 @@ def order_buy(
     order_class: str = typer.Option("simple", "--order-class", help="Order class (simple, bracket, oco)"),
     take_profit: float | None = typer.Option(None, "--take-profit", help="Take-profit limit price"),
     stop_loss: float | None = typer.Option(None, "--stop-loss", help="Stop-loss trigger price"),
+    short: bool = typer.Option(False, "--short/--no-short", help="Close an existing short position (buy-to-cover)"),
     actor: str = typer.Option("cli:manual", "--actor"),
 ) -> None:
-    """Place a buy order."""
+    """Place a buy order (open a long position, or buy-to-cover when --short is set)."""
     config = load_config()
     audit_path = get_audit_path(config)
     slippage = config.order.slippage_buffer_percent / 100.0
@@ -189,27 +190,38 @@ def order_buy(
     # Eager sync
     sync_outstanding_orders(conn, strategy_id, broker)
 
-    # Estimate cost
-    if order_type == "limit" and limit_price is not None:
-        estimated_cost = limit_price * qty
-    elif order_type in ("stop", "stop_limit") and stop_price is not None:
-        estimated_cost = stop_price * qty * (1 + slippage)
-    else:
-        # market or trailing_stop: use last price
-        try:
-            last_price = float(broker.get_last_price(symbol))
-        except RuntimeError as exc:
-            json_output({"error": f"Error fetching price for {symbol}: {exc}"})
-            typer.echo(f"Error fetching price for {symbol}: {exc}", err=True)
+    if short:
+        # Buy-to-cover an existing short position (mirrors sell --no-short)
+        estimated_cost = 0.0
+        ok, reason = check_buy_guard(conn, strategy_id, symbol, 0.0, short=True, qty=qty)
+        if not ok:
+            json_output({"error": f"Buy blocked: {reason}"})
+            typer.echo(f"Buy blocked: {reason}", err=True)
             raise typer.Exit(1)
-        estimated_cost = last_price * qty * (1 + slippage)
+        reserved_amt = float(qty)
+    else:
+        # Open a new long position
+        if order_type == "limit" and limit_price is not None:
+            estimated_cost = limit_price * qty
+        elif order_type in ("stop", "stop_limit") and stop_price is not None:
+            estimated_cost = stop_price * qty * (1 + slippage)
+        else:
+            # market or trailing_stop: use last price
+            try:
+                last_price = float(broker.get_last_price(symbol))
+            except RuntimeError as exc:
+                json_output({"error": f"Error fetching price for {symbol}: {exc}"})
+                typer.echo(f"Error fetching price for {symbol}: {exc}", err=True)
+                raise typer.Exit(1)
+            estimated_cost = last_price * qty * (1 + slippage)
 
-    # Buy guard
-    ok, reason = check_buy_guard(conn, strategy_id, symbol, estimated_cost)
-    if not ok:
-        json_output({"error": f"Buy blocked: {reason}"})
-        typer.echo(f"Buy blocked: {reason}", err=True)
-        raise typer.Exit(1)
+        # Buy guard
+        ok, reason = check_buy_guard(conn, strategy_id, symbol, estimated_cost, short=False, qty=qty)
+        if not ok:
+            json_output({"error": f"Buy blocked: {reason}"})
+            typer.echo(f"Buy blocked: {reason}", err=True)
+            raise typer.Exit(1)
+        reserved_amt = estimated_cost
 
     client_order_id = f"nx-{strategy[:6]}-{symbol}-{uuid4().hex[:8]}"
     now = _now()
@@ -225,14 +237,16 @@ def order_buy(
             strategy_id, symbol, qty, order_type,
             limit_price, stop_price, trail_percent, time_in_force,
             order_class, take_profit, stop_loss,
-            client_order_id, estimated_cost,
+            client_order_id, reserved_amt,
             actor, now, now,
         ),
     )
     order_id: int = cur.lastrowid
 
-    # Create cash reservation
-    create_reservation(conn, strategy_id, order_id, estimated_cost)
+    if short:
+        reserve_shares(conn, strategy_id, symbol, qty)
+    else:
+        create_reservation(conn, strategy_id, order_id, estimated_cost)
     conn.commit()
 
     # Submit to broker
@@ -249,12 +263,15 @@ def order_buy(
             stop_loss=stop_loss,
         )
     except RuntimeError as exc:
-        # Roll back: cancel order + release reservation
+        # Roll back: cancel order + release reservation/shares
         conn.execute(
             "UPDATE orders SET status = 'cancelled', updated_at = ? WHERE id = ?",
             (_now(), order_id),
         )
-        release_reservation(conn, order_id)
+        if short:
+            release_shares(conn, strategy_id, symbol, qty)
+        else:
+            release_reservation(conn, order_id)
         conn.commit()
         json_output({"error": f"Broker error: {exc}"})
         typer.echo(f"Broker error: {exc}", err=True)
@@ -276,6 +293,7 @@ def order_buy(
     log_event(audit_path, {
         "event": "order_submitted",
         "side": "buy",
+        "short": short,
         "strategy": strategy,
         "symbol": symbol,
         "qty": qty,
@@ -308,11 +326,13 @@ def order_sell(
     order_class: str = typer.Option("simple", "--order-class", help="Order class (simple, bracket, oco)"),
     take_profit: float | None = typer.Option(None, "--take-profit", help="Take-profit limit price"),
     stop_loss: float | None = typer.Option(None, "--stop-loss", help="Stop-loss trigger price"),
+    short: bool = typer.Option(False, "--short/--no-short", help="Open a new short position (mirrors buy)"),
     actor: str = typer.Option("cli:manual", "--actor"),
 ) -> None:
-    """Place a sell order."""
+    """Place a sell order (close a long position, or open a short position when --short is set)."""
     config = load_config()
     audit_path = get_audit_path(config)
+    slippage = config.order.slippage_buffer_percent / 100.0
 
     conn = get_connection()
     init_db(conn)
@@ -325,17 +345,41 @@ def order_sell(
     # Eager sync
     sync_outstanding_orders(conn, strategy_id, broker)
 
-    # Sell guard
-    ok, reason = check_sell_guard(conn, strategy_id, symbol, qty)
-    if not ok:
-        json_output({"error": f"Sell blocked: {reason}"})
-        typer.echo(f"Sell blocked: {reason}", err=True)
-        raise typer.Exit(1)
+    if short:
+        # Open a new short position (mirrors buy --no-short)
+        if order_type == "limit" and limit_price is not None:
+            estimated_cost = limit_price * qty
+        elif order_type in ("stop", "stop_limit") and stop_price is not None:
+            estimated_cost = stop_price * qty * (1 + slippage)
+        else:
+            try:
+                last_price = float(broker.get_last_price(symbol))
+            except RuntimeError as exc:
+                json_output({"error": f"Error fetching price for {symbol}: {exc}"})
+                typer.echo(f"Error fetching price for {symbol}: {exc}", err=True)
+                raise typer.Exit(1)
+            estimated_cost = last_price * qty * (1 + slippage)
+
+        ok, reason = check_sell_guard(conn, strategy_id, symbol, qty, short=True, estimated_cost=estimated_cost)
+        if not ok:
+            json_output({"error": f"Sell blocked: {reason}"})
+            typer.echo(f"Sell blocked: {reason}", err=True)
+            raise typer.Exit(1)
+        reserved_amt = estimated_cost
+    else:
+        # Close an existing long position
+        estimated_cost = 0.0
+        ok, reason = check_sell_guard(conn, strategy_id, symbol, qty, short=False)
+        if not ok:
+            json_output({"error": f"Sell blocked: {reason}"})
+            typer.echo(f"Sell blocked: {reason}", err=True)
+            raise typer.Exit(1)
+        reserved_amt = float(qty)
 
     client_order_id = f"nx-{strategy[:6]}-{symbol}-{uuid4().hex[:8]}"
     now = _now()
 
-    # Insert order record (status=pending), reserved_amount = qty (share count for reference)
+    # Insert order record (status=pending)
     cur = conn.execute(
         "INSERT INTO orders"
         " (strategy_id, symbol, side, qty, order_type, limit_price, stop_price, trail_percent,"
@@ -346,14 +390,16 @@ def order_sell(
             strategy_id, symbol, qty, order_type,
             limit_price, stop_price, trail_percent, time_in_force,
             order_class, take_profit, stop_loss,
-            client_order_id, float(qty),
+            client_order_id, reserved_amt,
             actor, now, now,
         ),
     )
     order_id: int = cur.lastrowid
 
-    # Reserve shares
-    reserve_shares(conn, strategy_id, symbol, qty)
+    if short:
+        create_reservation(conn, strategy_id, order_id, estimated_cost)
+    else:
+        reserve_shares(conn, strategy_id, symbol, qty)
     conn.commit()
 
     # Submit to broker
@@ -370,12 +416,15 @@ def order_sell(
             stop_loss=stop_loss,
         )
     except RuntimeError as exc:
-        # Roll back: cancel order + release shares
+        # Roll back: cancel order + release reservation/shares
         conn.execute(
             "UPDATE orders SET status = 'cancelled', updated_at = ? WHERE id = ?",
             (_now(), order_id),
         )
-        release_shares(conn, strategy_id, symbol, qty)
+        if short:
+            release_reservation(conn, order_id)
+        else:
+            release_shares(conn, strategy_id, symbol, qty)
         conn.commit()
         err_payload: dict = {"error": f"Broker error: {exc}"}
         _emit_ghost_hint(exc, broker, symbol, err_payload)
@@ -399,6 +448,7 @@ def order_sell(
     log_event(audit_path, {
         "event": "order_submitted",
         "side": "sell",
+        "short": short,
         "strategy": strategy,
         "symbol": symbol,
         "qty": qty,
@@ -423,7 +473,7 @@ def order_close(
     strategy: str = typer.Option(..., "--strategy", help="Strategy name"),
     actor: str = typer.Option("cli:manual", "--actor"),
 ) -> None:
-    """Close entire position in a symbol (sell all available shares)."""
+    """Close entire position in a symbol (sell long shares or buy-to-cover short shares)."""
     conn = get_connection()
     init_db(conn)
 
@@ -439,7 +489,7 @@ def order_close(
     sync_outstanding_orders(conn, strategy_id, broker)
 
     position = conn.execute(
-        "SELECT qty, reserved_qty FROM positions WHERE strategy_id = ? AND symbol = ? AND qty > 0",
+        "SELECT qty, reserved_qty FROM positions WHERE strategy_id = ? AND symbol = ? AND qty != 0",
         (strategy_id, symbol),
     ).fetchone()
     if position is None:
@@ -447,16 +497,23 @@ def order_close(
         typer.echo(f"Error: no position in {symbol} for strategy '{strategy}'.", err=True)
         raise typer.Exit(1)
 
-    available = position["qty"] - position["reserved_qty"]
+    is_short = position["qty"] < 0
+    available = abs(position["qty"]) - (position["reserved_qty"] or 0)
+    close_side = "buy" if is_short else "sell"
+
     if available <= 0:
-        json_output({"error": f"no available shares to sell for {symbol} (all reserved)"})
-        typer.echo(f"Error: no available shares to sell for {symbol} (all reserved).", err=True)
+        json_output({"error": f"no available shares to {close_side} for {symbol} (all reserved)"})
+        typer.echo(f"Error: no available shares to {close_side} for {symbol} (all reserved).", err=True)
         raise typer.Exit(1)
 
-    ok, reason = check_sell_guard(conn, strategy_id, symbol, available)
+    if is_short:
+        ok, reason = check_buy_guard(conn, strategy_id, symbol, 0.0, short=True, qty=available)
+    else:
+        ok, reason = check_sell_guard(conn, strategy_id, symbol, available, short=False)
     if not ok:
-        json_output({"error": f"Sell blocked: {reason}"})
-        typer.echo(f"Sell blocked: {reason}", err=True)
+        label = "Buy" if is_short else "Sell"
+        json_output({"error": f"{label} blocked: {reason}"})
+        typer.echo(f"{label} blocked: {reason}", err=True)
         raise typer.Exit(1)
 
     client_order_id = f"nx-{strategy[:6]}-{symbol}-{uuid4().hex[:8]}"
@@ -466,8 +523,8 @@ def order_close(
         "INSERT INTO orders"
         " (strategy_id, symbol, side, qty, order_type, limit_price, stop_price, trail_percent,"
         "  asset_class, status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
-        " VALUES (?, ?, 'sell', ?, 'market', NULL, NULL, NULL, 'equity', 'pending', ?, ?, 0, ?, ?, ?)",
-        (strategy_id, symbol, available, client_order_id, float(available), actor, now, now),
+        " VALUES (?, ?, ?, ?, 'market', NULL, NULL, NULL, 'equity', 'pending', ?, ?, 0, ?, ?, ?)",
+        (strategy_id, symbol, close_side, available, client_order_id, float(available), actor, now, now),
     )
     order_id: int = cur.lastrowid
 
@@ -475,7 +532,7 @@ def order_close(
     conn.commit()
 
     try:
-        result = broker.submit_order(symbol, available, "sell", "market", client_order_id=client_order_id)
+        result = broker.submit_order(symbol, available, close_side, "market", client_order_id=client_order_id)
     except RuntimeError as exc:
         conn.execute(
             "UPDATE orders SET status = 'cancelled', updated_at = ? WHERE id = ?",
@@ -497,7 +554,8 @@ def order_close(
 
     log_event(audit_path, {
         "event": "order_submitted",
-        "side": "sell",
+        "side": close_side,
+        "short": is_short,
         "action": "close",
         "strategy": strategy,
         "symbol": symbol,
@@ -1072,8 +1130,9 @@ def order_replace(
 @order_app.command("status")
 def order_status(
     order_id: int = typer.Argument(..., help="Order ID"),
+    sync: bool = typer.Option(True, "--sync/--no-sync", help="Sync outstanding order with broker before reading DB"),
 ) -> None:
-    """Show order status."""
+    """Show order status (eagerly syncing non-terminal orders with the broker by default)."""
     conn = get_connection()
     init_db(conn)
 
@@ -1086,6 +1145,32 @@ def order_status(
         json_output({"error": f"order {order_id} not found"})
         typer.echo(f"Error: order {order_id} not found.", err=True)
         raise typer.Exit(1)
+
+    if sync and row["status"] in (
+        "pending",
+        "submitted",
+        "partially_filled",
+        "cancel_pending",
+        "held",
+        "new",
+        "accepted",
+    ):
+        strat_row = conn.execute(
+            "SELECT s.id, b.profile_name AS broker_profile"
+            " FROM strategies s JOIN broker_accounts b ON s.broker_account_id = b.id"
+            " WHERE s.id = ?",
+            (row["strategy_id"],),
+        ).fetchone()
+        if strat_row is not None:
+            try:
+                broker = AlpacaBroker(strat_row["broker_profile"])
+                sync_outstanding_orders(conn, strat_row["id"], broker)
+                row = conn.execute(
+                    "SELECT * FROM orders WHERE id = ?",
+                    (order_id,),
+                ).fetchone()
+            except Exception:
+                pass
 
     if json_output(dict(row)):
         return
@@ -1104,15 +1189,33 @@ def order_list(
     side: OrderSide | None = typer.Option(None, "--side", help="Filter by side"),
     asset_class: AssetClass | None = typer.Option(None, "--asset-class", help="Filter by asset class"),
     order_class: str | None = typer.Option(None, "--order-class", help="Filter by order class"),
+    sync: bool = typer.Option(False, "--sync/--no-sync", help="Sync outstanding orders with broker before listing"),
 ) -> None:
-    """List orders with optional filters."""
+    """List orders across all tracked statuses with optional filters."""
     conn = get_connection()
     init_db(conn)
 
+    if sync:
+        strat_query = (
+            "SELECT s.id, b.profile_name AS broker_profile"
+            " FROM strategies s JOIN broker_accounts b ON s.broker_account_id = b.id"
+            " WHERE s.is_active = 1"
+        )
+        strat_params: list = []
+        if strategy is not None:
+            strat_query += " AND s.name = ?"
+            strat_params.append(strategy)
+        for s_row in conn.execute(strat_query, strat_params).fetchall():
+            try:
+                sync_outstanding_orders(conn, s_row["id"], AlpacaBroker(s_row["broker_profile"]))
+            except Exception:
+                pass
+
     query = (
         "SELECT o.id, s.name AS strategy, o.symbol, o.side, o.qty, o.order_type, o.order_class,"
-        "       o.take_profit_price, o.stop_loss_price,"
-        "       o.time_in_force, o.status, o.client_order_id, o.filled_qty, o.created_at"
+        "       o.limit_price, o.stop_price, o.take_profit_price, o.stop_loss_price,"
+        "       o.time_in_force, o.status, o.client_order_id, o.broker_order_id,"
+        "       o.parent_order_id, o.filled_qty, o.filled_avg_price, o.created_at"
         " FROM orders o"
         " JOIN strategies s ON o.strategy_id = s.id"
         " WHERE 1=1"
@@ -1122,7 +1225,7 @@ def order_list(
     if strategy is not None:
         query += " AND s.name = ?"
         params.append(strategy)
-    if status is not None:
+    if status is not None and status.lower() != "all":
         query += " AND o.status = ?"
         params.append(status)
     if symbol is not None:
@@ -1140,7 +1243,6 @@ def order_list(
     if order_class is not None:
         query += " AND o.order_class = ?"
         params.append(order_class)
-        params.append(asset_class.value)
 
     query += " ORDER BY o.id DESC"
 

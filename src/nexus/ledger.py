@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from nexus.models import AssetClass, OrderSide, OrderStatus, OptionRight, TransactionType
+from nexus.models import (
+    OrderSide,
+    OrderStatus,
+    TransactionType,
+)
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def create_reservation(
@@ -42,9 +46,9 @@ def reserve_shares(
 def release_shares(
     conn: sqlite3.Connection, strategy_id: int, symbol: str, qty: int
 ) -> None:
-    """Decrement reserved_qty on a position (called on sell fill or cancel)."""
+    """Decrement reserved_qty on a position (called on close fill or cancel)."""
     conn.execute(
-        "UPDATE positions SET reserved_qty = reserved_qty - ?, updated_at = ? "
+        "UPDATE positions SET reserved_qty = MAX(0, reserved_qty - ?), updated_at = ? "
         "WHERE strategy_id = ? AND symbol = ?",
         (qty, _now(), strategy_id, symbol),
     )
@@ -86,11 +90,11 @@ def update_position_on_fill(
 ) -> None:
     """Create or update position record after a fill.
 
-    Buy: create position if not exists, or increase qty and recalculate avg_entry_price.
-    Sell: decrease qty. If qty reaches 0, delete the position row.
-
-    Average entry recalculation for buys:
-      new_avg = ((old_qty * old_avg) + (fill_qty * fill_price)) / (old_qty + fill_qty)
+    Handles four transitions:
+    1. Buy when flat or long (qty >= 0): open/increase long position, update avg_entry_price.
+    2. Buy when short (qty < 0): buy-to-cover; increase qty toward 0 (delete row if >= 0).
+    3. Sell when long (qty > 0): close/reduce long position; decrease qty toward 0 (delete row if <= 0).
+    4. Sell when flat or short (qty <= 0): open/increase short position (negative qty), update avg_entry_price.
     """
     now = _now()
     if side == OrderSide.buy:
@@ -104,11 +108,25 @@ def update_position_on_fill(
                 "opened_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)",
                 (strategy_id, symbol, qty, price, now, now),
             )
+        elif row["qty"] < 0:
+            # Buy-to-cover an existing short position
+            new_qty = row["qty"] + qty
+            if new_qty >= 0:
+                conn.execute(
+                    "DELETE FROM positions WHERE strategy_id = ? AND symbol = ?",
+                    (strategy_id, symbol),
+                )
+            else:
+                conn.execute(
+                    "UPDATE positions SET qty = ?, updated_at = ? "
+                    "WHERE strategy_id = ? AND symbol = ?",
+                    (new_qty, now, strategy_id, symbol),
+                )
         else:
             old_qty = row["qty"]
             old_avg = row["avg_entry_price"] or 0.0
             new_qty = old_qty + qty
-            new_avg = ((old_qty * old_avg) + (qty * price)) / new_qty
+            new_avg = ((old_qty * old_avg) + (qty * price)) / new_qty if new_qty > 0 else price
             conn.execute(
                 "UPDATE positions SET qty = ?, avg_entry_price = ?, updated_at = ? "
                 "WHERE strategy_id = ? AND symbol = ?",
@@ -117,10 +135,29 @@ def update_position_on_fill(
     else:
         # sell side
         row = conn.execute(
-            "SELECT qty FROM positions WHERE strategy_id = ? AND symbol = ?",
+            "SELECT qty, avg_entry_price FROM positions WHERE strategy_id = ? AND symbol = ?",
             (strategy_id, symbol),
         ).fetchone()
-        if row is not None:
+        if row is None:
+            # Open new short position (negative qty)
+            conn.execute(
+                "INSERT INTO positions (strategy_id, symbol, qty, reserved_qty, avg_entry_price, "
+                "opened_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)",
+                (strategy_id, symbol, -qty, price, now, now),
+            )
+        elif row["qty"] <= 0:
+            # Increase existing short position
+            old_abs = abs(row["qty"])
+            old_avg = row["avg_entry_price"] or 0.0
+            new_abs = old_abs + qty
+            new_avg = ((old_abs * old_avg) + (qty * price)) / new_abs if new_abs > 0 else price
+            conn.execute(
+                "UPDATE positions SET qty = ?, avg_entry_price = ?, updated_at = ? "
+                "WHERE strategy_id = ? AND symbol = ?",
+                (-new_abs, new_avg, now, strategy_id, symbol),
+            )
+        else:
+            # Close/reduce existing long position
             new_qty = row["qty"] - qty
             if new_qty <= 0:
                 conn.execute(
@@ -147,9 +184,9 @@ def process_fill(
     Steps:
     1. Fetch the order row
     2. Update order: status='filled', filled_qty, filled_avg_price, filled_at, updated_at
-    3. Release reservation (for buys: delete from reservations; for sells: release_shares)
+    3. Release reservation (cash reservation for opening orders; share reservation for closing orders)
     4. Record transaction (buy: negative amount; sell: positive)
-    5. Update position (buy: add shares; sell: remove shares)
+    5. Update position (long or short)
     6. Commit
     """
     order = conn.execute(
@@ -171,8 +208,12 @@ def process_fill(
         (OrderStatus.filled, filled_qty, filled_avg_price, filled_at, _now(), order_id),
     )
 
-    # Step 3: release reservation
-    if side == OrderSide.buy:
+    # Step 3: release reservation (cash reservation if present, otherwise share reservation)
+    has_cash_res = (
+        conn.execute("SELECT 1 FROM reservations WHERE order_id = ?", (order_id,)).fetchone()
+        is not None
+    )
+    if has_cash_res:
         release_reservation(conn, order_id)
     else:
         release_shares(conn, strategy_id, symbol, filled_qty)
@@ -201,7 +242,7 @@ def process_cancel(conn: sqlite3.Connection, order_id: int) -> None:
     Steps:
     1. Fetch order row
     2. Update order: status='cancelled', cancel_attempts=0, updated_at
-    3. Release reservation (buy: delete reservation row; sell: release_shares)
+    3. Release reservation (cash reservation if present, otherwise share reservation)
     4. Commit
     """
     order = conn.execute(
@@ -213,7 +254,6 @@ def process_cancel(conn: sqlite3.Connection, order_id: int) -> None:
 
     strategy_id = order["strategy_id"]
     symbol = order["symbol"]
-    side = order["side"]
     qty = order["qty"]
 
     # Step 2: update order status
@@ -222,8 +262,12 @@ def process_cancel(conn: sqlite3.Connection, order_id: int) -> None:
         (OrderStatus.cancelled, _now(), order_id),
     )
 
-    # Step 3: release reservation
-    if side == OrderSide.buy:
+    # Step 3: release reservation (cash reservation if present, otherwise share reservation)
+    has_cash_res = (
+        conn.execute("SELECT 1 FROM reservations WHERE order_id = ?", (order_id,)).fetchone()
+        is not None
+    )
+    if has_cash_res:
         release_reservation(conn, order_id)
     else:
         release_shares(conn, strategy_id, symbol, qty)

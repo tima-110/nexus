@@ -4,7 +4,7 @@ from __future__ import annotations
 import html
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from nexus.config import NexusConfig, get_audit_path, get_db_path
@@ -74,7 +74,7 @@ def _collect_data(
     except Exception:
         _v = "unknown"
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cutoff = (now - timedelta(days=days)).isoformat()
     stale_cutoff = (now - timedelta(hours=_STALE_HOURS)).isoformat()
 
@@ -318,15 +318,20 @@ def _collect_strategies(
             (sid,),
         ).fetchone()[0]
         eq_rows = conn.execute(
-            "SELECT symbol, qty, avg_entry_price FROM positions WHERE strategy_id = ? AND qty > 0",
+            "SELECT symbol, qty, avg_entry_price FROM positions WHERE strategy_id = ? AND qty != 0",
             (sid,),
         ).fetchall()
         opt_count = conn.execute(
             "SELECT COUNT(*) FROM option_positions WHERE strategy_id = ? AND qty > 0",
             (sid,),
         ).fetchone()[0]
+        short_locked = conn.execute(
+            "SELECT COALESCE(SUM(2.0 * ABS(qty) * COALESCE(avg_entry_price, 0.0)), 0.0) "
+            "FROM positions WHERE strategy_id = ? AND qty < 0",
+            (sid,),
+        ).fetchone()[0]
         cash = float(r["cash_balance"] or 0.0)
-        available = cash - float(reserved or 0.0)
+        available = cash - float(reserved or 0.0) - float(short_locked or 0.0)
         mv = 0.0
         live_any = False
         for p in eq_rows:
@@ -342,7 +347,7 @@ def _collect_strategies(
                 "broker": r["profile_name"],
                 "is_active": bool(r["is_active"]),
                 "cash": cash,
-                "reserved": float(reserved or 0.0),
+                "reserved": float(reserved or 0.0) + float(short_locked or 0.0),
                 "available": available,
                 "buying_power": available * float(r["margin_multiplier"] or 1.0),
                 "positions_value": mv,
@@ -371,7 +376,7 @@ def _collect_positions(
     eq_query = (
         "SELECT p.symbol, p.qty, p.reserved_qty, p.avg_entry_price, s.name AS strategy"
         " FROM positions p JOIN strategies s ON p.strategy_id = s.id"
-        " WHERE p.qty > 0"
+        " WHERE p.qty != 0"
     )
     opt_query = (
         "SELECT op.symbol, op.underlying, op.option_right, op.side, op.qty,"
@@ -399,9 +404,10 @@ def _collect_positions(
             {
                 "strategy": r["strategy"],
                 "symbol": r["symbol"],
+                "side": "short" if qty < 0 else "long",
                 "qty": qty,
                 "reserved": reserved,
-                "available": qty - reserved,
+                "available": abs(qty) - reserved,
                 "avg_entry": r["avg_entry_price"],
                 "live_price": live["current"] if live else None,
                 "market_value": mv,
@@ -410,7 +416,7 @@ def _collect_positions(
         )
 
     options = []
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     for r in conn.execute(opt_query, params).fetchall():
         qty = int(r["qty"] or 0)
         avg = float(r["avg_entry_price"] or 0.0)

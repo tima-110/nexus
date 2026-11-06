@@ -28,7 +28,7 @@ def position_list(
         "SELECT p.*, s.name AS strategy_name"
         " FROM positions p"
         " JOIN strategies s ON p.strategy_id = s.id"
-        " WHERE p.qty > 0"
+        " WHERE p.qty != 0"
     )
     eq_params: list = []
     if strategy is not None:
@@ -49,7 +49,7 @@ def position_list(
     if strategy is not None:
         opt_query += " AND s.name = ?"
         opt_params.append(strategy)
-    opt_query += " ORDER BY s.name, op.underlying, op.expiry"
+    opt_query += " ORDER BY s.name, op.expiry"
 
     opt_rows = conn.execute(opt_query, opt_params).fetchall()
 
@@ -57,13 +57,16 @@ def position_list(
     items: list[dict] = []
 
     for r in eq_rows:
+        qty_val = r["qty"] or 0
+        res_val = r["reserved_qty"] or 0
         items.append({
             "strategy": r["strategy_name"],
             "symbol": r["symbol"],
             "asset_class": "equity",
-            "qty": r["qty"] or 0,
-            "reserved_qty": r["reserved_qty"] or 0,
-            "available": (r["qty"] or 0) - (r["reserved_qty"] or 0),
+            "side": "short" if qty_val < 0 else "long",
+            "qty": qty_val,
+            "reserved_qty": res_val,
+            "available": abs(qty_val) - res_val,
             "avg_entry_price": r["avg_entry_price"],
         })
 
@@ -159,14 +162,14 @@ def position_show(
         "SELECT * FROM positions WHERE strategy_id = ? AND symbol = ?",
         (strategy_id, symbol),
     ).fetchone()
-    if position is None or (position["qty"] or 0) <= 0:
+    if position is None or (position["qty"] or 0) == 0:
         json_output({"error": f"No position in {symbol} for strategy '{strategy}'"})
         typer.echo(f"Error: No position in {symbol} for strategy '{strategy}'.", err=True)
         raise typer.Exit(1)
 
     qty = position["qty"] or 0
     reserved = position["reserved_qty"] or 0
-    available = qty - reserved
+    available = abs(qty) - reserved
     avg_entry = position["avg_entry_price"]
     cost_basis = qty * (avg_entry or 0.0)
 
@@ -197,7 +200,7 @@ def position_show(
 
     typer.echo(f"Strategy:    {strategy}")
     typer.echo(f"Symbol:      {symbol}")
-    typer.echo(f"Asset class: equity")
+    typer.echo("Asset class: equity")
     typer.echo(f"Quantity:    {qty}")
     typer.echo(f"Reserved:    {reserved}")
     typer.echo(f"Available:   {available}")
@@ -294,7 +297,7 @@ def _show_option_position(
 
     typer.echo(f"Strategy:    {strategy_name}")
     typer.echo(f"Symbol:      {symbol}")
-    typer.echo(f"Asset class: option")
+    typer.echo("Asset class: option")
     typer.echo(f"Underlying:  {underlying}")
     typer.echo(f"Right:       {right.upper()}")
     typer.echo(f"Side:        {side}")

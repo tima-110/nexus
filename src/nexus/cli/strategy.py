@@ -1,7 +1,7 @@
 """Strategy management commands."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import typer
@@ -39,7 +39,7 @@ def strategy_create(
         cur = conn.execute(
             "INSERT INTO strategies (name, broker_account_id, cash_balance, is_active, created_at)"
             " VALUES (?, ?, ?, 1, ?)",
-            (name, broker_account_id, balance, datetime.now(timezone.utc).isoformat()),
+            (name, broker_account_id, balance, datetime.now(UTC).isoformat()),
         )
         conn.commit()
     except Exception as exc:
@@ -107,7 +107,7 @@ def strategy_show(name: str = typer.Argument(..., help="Strategy name")) -> None
 
     strategy_id = row["id"]
     positions = conn.execute(
-        "SELECT * FROM positions WHERE strategy_id = ? AND qty > 0",
+        "SELECT * FROM positions WHERE strategy_id = ? AND qty != 0",
         (strategy_id,),
     ).fetchall()
     open_orders = conn.execute(
@@ -165,7 +165,7 @@ def strategy_show(name: str = typer.Argument(..., help="Strategy name")) -> None
         typer.echo("-" * len(pos_header))
         for p in positions:
             reserved = p["reserved_qty"] or 0
-            available = p["qty"] - reserved
+            available = abs(p["qty"]) - reserved
             avg_entry = p["avg_entry_price"] or 0.0
             typer.echo(
                 f"{p['symbol']:<10} {p['qty']:>8} {reserved:>10} {available:>10} {avg_entry:>12.4f}"
@@ -340,7 +340,7 @@ def strategy_delete(
     ).fetchall()
 
     positions = conn.execute(
-        "SELECT symbol, qty, reserved_qty FROM positions WHERE strategy_id = ? AND qty > 0",
+        "SELECT symbol, qty, reserved_qty FROM positions WHERE strategy_id = ? AND qty != 0",
         (strategy_id,),
     ).fetchall()
 
@@ -422,22 +422,24 @@ def strategy_delete(
             pending_count += 1
     conn.commit()
 
-    # Market sell each position
+    # Market close each position (sell long or buy-to-cover short)
     for pos in positions:
         symbol = pos["symbol"]
-        available = pos["qty"] - (pos["reserved_qty"] or 0)
+        is_short = pos["qty"] < 0
+        close_side = "buy" if is_short else "sell"
+        available = abs(pos["qty"]) - (pos["reserved_qty"] or 0)
         if available <= 0:
             continue
 
         client_order_id = f"nx-{name[:6]}-{symbol}-{uuid4().hex[:8]}"
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
 
         cur = conn.execute(
             "INSERT INTO orders"
             " (strategy_id, symbol, side, qty, order_type,"
             "  status, client_order_id, reserved_amount, filled_qty, actor, created_at, updated_at)"
-            " VALUES (?, ?, 'sell', ?, 'market', 'pending', ?, ?, 0, 'cli:liquidate', ?, ?)",
-            (strategy_id, symbol, available, client_order_id, float(available), now, now),
+            " VALUES (?, ?, ?, ?, 'market', 'pending', ?, ?, 0, 'cli:liquidate', ?, ?)",
+            (strategy_id, symbol, close_side, available, client_order_id, float(available), now, now),
         )
         order_id = cur.lastrowid
 
@@ -446,22 +448,22 @@ def strategy_delete(
         conn.commit()
 
         try:
-            result = broker.submit_order(symbol, available, "sell", "market", client_order_id=client_order_id)
+            result = broker.submit_order(symbol, available, close_side, "market", client_order_id=client_order_id)
             conn.execute(
                 "UPDATE orders SET status = 'submitted', broker_order_id = ?, updated_at = ? WHERE id = ?",
-                (result.broker_order_id, datetime.now(timezone.utc).isoformat(), order_id),
+                (result.broker_order_id, datetime.now(UTC).isoformat(), order_id),
             )
             conn.commit()
             closed_symbols.append(symbol)
         except RuntimeError as exc:
             conn.execute(
                 "UPDATE orders SET status = 'cancelled', updated_at = ? WHERE id = ?",
-                (datetime.now(timezone.utc).isoformat(), order_id),
+                (datetime.now(UTC).isoformat(), order_id),
             )
             from nexus.ledger import release_shares
             release_shares(conn, strategy_id, symbol, available)
             conn.commit()
-            msg = f"Broker error selling {symbol}: {exc}. Strategy not deleted."
+            msg = f"Broker error closing {symbol}: {exc}. Strategy not deleted."
             json_output({"error": msg})
             typer.echo(f"Error: {msg}", err=True)
             raise typer.Exit(1)
@@ -472,7 +474,7 @@ def strategy_delete(
 
     # Verify all positions are flat
     remaining = conn.execute(
-        "SELECT symbol, qty FROM positions WHERE strategy_id = ? AND qty > 0",
+        "SELECT symbol, qty FROM positions WHERE strategy_id = ? AND qty != 0",
         (strategy_id,),
     ).fetchall()
     if remaining:

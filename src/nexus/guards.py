@@ -7,45 +7,85 @@ import sqlite3
 from nexus.occ import is_occ_symbol, parse_occ_symbol
 
 
-def check_buy_guard(
-    conn: sqlite3.Connection,
-    strategy_id: int,
-    symbol: str,
-    estimated_cost: float,
-) -> tuple[bool, str]:
-    """Check if a buy order is allowed.
+def _get_available_cash(conn: sqlite3.Connection, strategy_id: int) -> tuple[float | None, str]:
+    """Compute available cash for opening new positions (long or short).
 
-    Validates:
-    1. Strategy does NOT already hold the symbol (no duplicate positions)
-    2. Available buying power >= estimated_cost
-
-    Available buying power = strategy.cash_balance - sum(active reservations for this strategy)
-
-    Returns (True, "") if OK, (False, "reason") if blocked.
+    Subtracts active order reservations and locked short-sale proceeds + collateral
+    (2 * abs(qty) * avg_entry_price for any open short equity position with qty < 0,
+    since short sale proceeds were credited to cash_balance on fill).
     """
-    if is_occ_symbol(symbol):
-        return check_option_buy_guard(conn, strategy_id, symbol, estimated_cost)
-
-    row = conn.execute(
-        "SELECT id FROM positions WHERE strategy_id = ? AND symbol = ? AND qty > 0",
-        (strategy_id, symbol),
-    ).fetchone()
-    if row is not None:
-        return False, f"already holding position in {symbol}"
-
     strategy = conn.execute(
         "SELECT cash_balance FROM strategies WHERE id = ?",
         (strategy_id,),
     ).fetchone()
     if strategy is None:
-        return False, f"strategy {strategy_id} not found"
+        return None, f"strategy {strategy_id} not found"
 
     reserved = conn.execute(
         "SELECT COALESCE(SUM(amount), 0) FROM reservations WHERE strategy_id = ?",
         (strategy_id,),
     ).fetchone()[0]
 
-    available = strategy["cash_balance"] - reserved
+    short_locked = conn.execute(
+        "SELECT COALESCE(SUM(2.0 * ABS(qty) * COALESCE(avg_entry_price, 0.0)), 0.0) "
+        "FROM positions WHERE strategy_id = ? AND qty < 0",
+        (strategy_id,),
+    ).fetchone()[0]
+
+    available = float(strategy["cash_balance"]) - float(reserved) - float(short_locked)
+    return available, ""
+
+
+def check_buy_guard(
+    conn: sqlite3.Connection,
+    strategy_id: int,
+    symbol: str,
+    estimated_cost: float,
+    *,
+    short: bool = False,
+    qty: int = 0,
+) -> tuple[bool, str]:
+    """Check if a buy order is allowed.
+
+    When short=False (default — Open Long):
+    1. Strategy does NOT already hold the symbol (no duplicate positions)
+    2. Available buying power >= estimated_cost
+
+    When short=True (Close Short / Buy-to-Cover):
+    1. Strategy MUST hold a short position in the symbol (qty < 0)
+    2. Available short shares (abs(qty) - reserved_qty) >= requested qty
+
+    Returns (True, "") if OK, (False, "reason") if blocked.
+    """
+    if is_occ_symbol(symbol):
+        return check_option_buy_guard(conn, strategy_id, symbol, estimated_cost)
+
+    if short:
+        position = conn.execute(
+            "SELECT qty, reserved_qty FROM positions WHERE strategy_id = ? AND symbol = ? AND qty < 0",
+            (strategy_id, symbol),
+        ).fetchone()
+        if position is None:
+            return False, f"no short position in {symbol}"
+
+        available_shares = abs(position["qty"]) - (position["reserved_qty"] or 0)
+        if available_shares < qty:
+            return False, (
+                f"insufficient shares: need {qty}, have {available_shares} available"
+            )
+        return True, ""
+
+    row = conn.execute(
+        "SELECT id FROM positions WHERE strategy_id = ? AND symbol = ? AND qty != 0",
+        (strategy_id, symbol),
+    ).fetchone()
+    if row is not None:
+        return False, f"already holding position in {symbol}"
+
+    available, err = _get_available_cash(conn, strategy_id)
+    if available is None:
+        return False, err
+
     if available < estimated_cost:
         return False, (
             f"insufficient buying power: need {estimated_cost:.2f}, have {available:.2f}"
@@ -59,19 +99,42 @@ def check_sell_guard(
     strategy_id: int,
     symbol: str,
     qty: int,
+    *,
+    short: bool = False,
+    estimated_cost: float = 0.0,
 ) -> tuple[bool, str]:
     """Check if a sell order is allowed.
 
-    Validates:
+    When short=False (default — Close Long):
     1. Strategy MUST hold the symbol (position exists with qty > 0)
-    2. Available shares >= requested qty
+    2. Available shares (position.qty - position.reserved_qty) >= requested qty
 
-    Available shares = position.qty - position.reserved_qty
+    When short=True (Open Short — mirrors check_buy_guard with short=False):
+    1. Strategy does NOT already hold the symbol (no duplicate positions)
+    2. Available buying power >= estimated_cost
 
     Returns (True, "") if OK, (False, "reason") if blocked.
     """
     if is_occ_symbol(symbol):
         return check_option_sell_guard(conn, strategy_id, symbol, qty)
+
+    if short:
+        row = conn.execute(
+            "SELECT id FROM positions WHERE strategy_id = ? AND symbol = ? AND qty != 0",
+            (strategy_id, symbol),
+        ).fetchone()
+        if row is not None:
+            return False, f"already holding position in {symbol}"
+
+        available, err = _get_available_cash(conn, strategy_id)
+        if available is None:
+            return False, err
+
+        if available < estimated_cost:
+            return False, (
+                f"insufficient buying power: need {estimated_cost:.2f}, have {available:.2f}"
+            )
+        return True, ""
 
     position = conn.execute(
         "SELECT qty, reserved_qty FROM positions WHERE strategy_id = ? AND symbol = ? AND qty > 0",

@@ -1,10 +1,9 @@
 """Tests for nexus.ledger — financial operations."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
-
 from nexus.ledger import (
     create_reservation,
     process_cancel,
@@ -19,7 +18,7 @@ from nexus.models import OrderStatus
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _insert_order(
@@ -328,3 +327,56 @@ class TestProcessCancel:
     def test_cancel_raises_for_missing_order(self, conn):
         with pytest.raises(ValueError, match="not found"):
             process_cancel(conn, 9999)
+
+
+class TestShortPositionLifecycle:
+    def test_short_open_and_buy_to_cover_full_lifecycle(self, conn, sample_strategy):
+        # 1. Open short: sell --short 4 shares of GS @ 900.0
+        short_order_id = _insert_order(conn, sample_strategy, "GS", "sell", qty=4)
+        create_reservation(conn, sample_strategy, short_order_id, 3600.0)
+        conn.commit()
+
+        process_fill(conn, short_order_id, 4, 900.0, _now())
+
+        # Reservation released
+        assert (
+            conn.execute(
+                "SELECT * FROM reservations WHERE order_id = ?", (short_order_id,)
+            ).fetchone()
+            is None
+        )
+
+        # Short position created with qty = -4
+        pos = conn.execute(
+            "SELECT * FROM positions WHERE strategy_id = ? AND symbol = ?",
+            (sample_strategy, "GS"),
+        ).fetchone()
+        assert pos is not None
+        assert pos["qty"] == -4
+        assert pos["avg_entry_price"] == pytest.approx(900.0)
+
+        # Cash balance credited +3600 -> 13600 (matches broker cash)
+        strat = conn.execute(
+            "SELECT cash_balance FROM strategies WHERE id = ?", (sample_strategy,)
+        ).fetchone()
+        assert strat["cash_balance"] == pytest.approx(13600.0)
+
+        # 2. Close short (buy-to-cover): buy --short 4 shares of GS @ 850.0 (+200 profit)
+        reserve_shares(conn, sample_strategy, "GS", 4)
+        cover_order_id = _insert_order(conn, sample_strategy, "GS", "buy", qty=4)
+        conn.commit()
+
+        process_fill(conn, cover_order_id, 4, 850.0, _now())
+
+        # Short position closed and deleted
+        pos_after = conn.execute(
+            "SELECT * FROM positions WHERE strategy_id = ? AND symbol = ?",
+            (sample_strategy, "GS"),
+        ).fetchone()
+        assert pos_after is None
+
+        # Cash balance debited -3400 -> 10200 (+200 realized profit)
+        strat_after = conn.execute(
+            "SELECT cash_balance FROM strategies WHERE id = ?", (sample_strategy,)
+        ).fetchone()
+        assert strat_after["cash_balance"] == pytest.approx(10200.0)
