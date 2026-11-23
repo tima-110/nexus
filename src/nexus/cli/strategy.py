@@ -35,19 +35,35 @@ def strategy_create(
 
     broker_account_id = broker_row["id"]
 
+    if balance < 0:
+        json_output({"error": "initial balance cannot be negative"})
+        typer.echo("Error: initial balance cannot be negative.", err=True)
+        raise typer.Exit(1)
+
     try:
         cur = conn.execute(
             "INSERT INTO strategies (name, broker_account_id, cash_balance, is_active, created_at)"
             " VALUES (?, ?, ?, 1, ?)",
-            (name, broker_account_id, balance, datetime.now(UTC).isoformat()),
+            (name, broker_account_id, 0.0, datetime.now(UTC).isoformat()),
         )
+        strategy_id = cur.lastrowid
+        if balance > 0:
+            record_transaction(
+                conn,
+                strategy_id=strategy_id,
+                order_id=None,
+                txn_type="deposit",
+                amount=balance,
+                actor="cli:strategy_create",
+                note="Initial strategy funding",
+            )
         conn.commit()
     except Exception as exc:
         json_output({"error": str(exc)})
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
 
-    if json_output({"status": "ok", "name": name, "strategy_id": cur.lastrowid}):
+    if json_output({"status": "ok", "name": name, "strategy_id": strategy_id}):
         return
     typer.echo(f"Strategy '{name}' created (broker={broker}, balance={balance:.2f}).")
 

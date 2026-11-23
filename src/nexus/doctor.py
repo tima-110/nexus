@@ -151,24 +151,21 @@ def _check_no_stale_orders(conn: sqlite3.Connection) -> DoctorCheck:
 
 def _check_balance_consistent(conn: sqlite3.Connection) -> DoctorCheck:
     """Compare strategy cash balances against transaction sums.
-    
-    Strategies start with $10,000 initial capital. The cash_balance should equal
-    10000 + sum(transactions).
+
+    The cash_balance should equal sum(transactions) including initial funding deposits.
     """
     name = "balance_consistent"
     try:
         cursor = conn.execute("SELECT id, name, cash_balance FROM strategies")
         strategies = cursor.fetchall()
         inconsistent = []
-        INITIAL_CAPITAL = 10000.0
         for strat in strategies:
             tx_cursor = conn.execute(
                 "SELECT COALESCE(SUM(amount), 0) as total FROM transactions "
                 "WHERE strategy_id = ?",
                 (strat["id"],),
             )
-            tx_total = tx_cursor.fetchone()["total"]
-            expected_balance = INITIAL_CAPITAL + tx_total
+            expected_balance = tx_cursor.fetchone()["total"]
             drift = abs(strat["cash_balance"] - expected_balance)
             if drift > 0.01:
                 inconsistent.append(f"{strat['name']} (drift=${drift:.2f})")

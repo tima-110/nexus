@@ -128,10 +128,31 @@ class TestBalanceConsistent:
     @patch("nexus.doctor.get_schedule_status", return_value={"installed": False, "schedule": None, "command": None})
     @patch("subprocess.run")
     def test_balance_consistent_passes(self, mock_subprocess, mock_cron, conn, sample_strategy):
-        """Should pass when strategy balance matches initial capital + transaction sum."""
+        """Should pass when strategy balance matches transaction sum."""
         mock_subprocess.return_value = MagicMock(returncode=1, stdout="", stderr="error")
 
-        # Strategy has cash_balance=10000 from fixture; no transactions needed (initial capital)
+        # Strategy has cash_balance=10000 and matching initial deposit transaction from fixture
+        config = NexusConfig()
+        checks = run_doctor(conn, config)
+        check = _find_check(checks, "balance_consistent")
+        assert check.passed is True
+
+    @patch("nexus.doctor.get_schedule_status", return_value={"installed": False, "schedule": None, "command": None})
+    @patch("subprocess.run")
+    def test_balance_consistent_arbitrary_initial_capital(self, mock_subprocess, mock_cron, conn, sample_broker):
+        """Should pass for any starting balance (e.g. $25,000) backed by deposit transactions."""
+        mock_subprocess.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+        now = _now()
+        cur = conn.execute(
+            "INSERT INTO strategies (name, broker_account_id, cash_balance, is_active, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("core_rotation", sample_broker, 25000.0, 1, now),
+        )
+        conn.execute(
+            "INSERT INTO transactions (strategy_id, type, amount, actor, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (cur.lastrowid, "deposit", 25000.0, "cli:strategy_create", "Initial strategy funding", now),
+        )
+        conn.commit()
+
         config = NexusConfig()
         checks = run_doctor(conn, config)
         check = _find_check(checks, "balance_consistent")
@@ -140,10 +161,10 @@ class TestBalanceConsistent:
     @patch("nexus.doctor.get_schedule_status", return_value={"installed": False, "schedule": None, "command": None})
     @patch("subprocess.run")
     def test_balance_consistent_fails(self, mock_subprocess, mock_cron, conn, sample_strategy):
-        """Should fail when strategy balance does not match initial capital + transaction sum."""
+        """Should fail when strategy balance does not match transaction sum."""
         mock_subprocess.return_value = MagicMock(returncode=1, stdout="", stderr="error")
 
-        # Strategy has cash_balance=10000 but add a transaction that makes expected = 11000
+        # Strategy has cash_balance=10000 and +10000 initial deposit; insert -1000 tx without updating cash_balance
         conn.execute(
             "INSERT INTO transactions (strategy_id, type, amount, actor, created_at) VALUES (?, ?, ?, ?, ?)",
             (sample_strategy, "fill_buy", -1000.0, "test", _now()),

@@ -32,10 +32,16 @@ def sample_broker(conn):
 
 @pytest.fixture
 def sample_strategy(conn, sample_broker):
-    """Insert a strategy with $10000 balance, return its id."""
-    conn.execute(
+    """Insert a strategy with $10000 balance and matching initial deposit, return its id."""
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
         "INSERT INTO strategies (name, broker_account_id, cash_balance, is_active, created_at) VALUES (?, ?, ?, ?, ?)",
-        ("test_strat", sample_broker, 10000.0, 1, datetime.now(timezone.utc).isoformat()),
+        ("test_strat", sample_broker, 10000.0, 1, now),
+    )
+    strategy_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO transactions (strategy_id, type, amount, actor, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (strategy_id, "deposit", 10000.0, "test:fixture", "Initial strategy funding", now),
     )
     conn.commit()
-    return 1
+    return strategy_id

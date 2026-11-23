@@ -298,3 +298,48 @@ class TestStrategyDelete:
         assert "broker error" in result.output.lower() or "broker error" in (result.stderr or "").lower()
         # Strategy should NOT be deleted
         assert conn.execute("SELECT * FROM strategies WHERE name = 'test_strat'").fetchone() is not None
+
+
+class TestStrategyCreate:
+    def test_create_records_initial_deposit_transaction(self):
+        conn = _setup_test_db()
+        result = _invoke(conn, ["strategy", "create", "core_rotation", "--broker", "paper1", "--balance", "25000"])
+        assert result.exit_code == 0, result.output
+
+        strat = conn.execute(
+            "SELECT id, cash_balance FROM strategies WHERE name = 'core_rotation'"
+        ).fetchone()
+        assert strat is not None
+        assert strat["cash_balance"] == pytest.approx(25000.0)
+
+        tx = conn.execute(
+            "SELECT type, amount, actor, note FROM transactions WHERE strategy_id = ?",
+            (strat["id"],),
+        ).fetchone()
+        assert tx is not None
+        assert tx["type"] == "deposit"
+        assert tx["amount"] == pytest.approx(25000.0)
+        assert tx["actor"] == "cli:strategy_create"
+
+    def test_create_zero_balance_skips_deposit_transaction(self):
+        conn = _setup_test_db()
+        result = _invoke(conn, ["strategy", "create", "zero_strat", "--broker", "paper1", "--balance", "0"])
+        assert result.exit_code == 0, result.output
+
+        strat = conn.execute(
+            "SELECT id, cash_balance FROM strategies WHERE name = 'zero_strat'"
+        ).fetchone()
+        assert strat is not None
+        assert strat["cash_balance"] == pytest.approx(0.0)
+
+        tx_count = conn.execute(
+            "SELECT COUNT(*) FROM transactions WHERE strategy_id = ?",
+            (strat["id"],),
+        ).fetchone()[0]
+        assert tx_count == 0
+
+    def test_create_negative_balance_fails(self):
+        conn = _setup_test_db()
+        result = _invoke(conn, ["strategy", "create", "bad_strat", "--broker", "paper1", "--balance", "-100"])
+        assert result.exit_code != 0
+        assert conn.execute("SELECT * FROM strategies WHERE name = 'bad_strat'").fetchone() is None
