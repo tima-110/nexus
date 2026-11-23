@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from decimal import Decimal
 
 from nexus.broker.types import BrokerAccount, BrokerOrder, BrokerPosition, BrokerOptionPosition
 from nexus.occ import parse_occ_symbol
+
+# Env vars that cause the alpaca CLI to ignore `--profile <name>`.
+_OVERRIDDEN_ALPACA_ENV_VARS = (
+    "APCA_API_KEY_ID",
+    "APCA_API_SECRET_KEY",
+    "APCA_API_BASE_URL",
+    "ALPACA_API_KEY",
+    "ALPACA_SECRET_KEY",
+)
 
 
 class AlpacaBroker:
@@ -13,11 +23,15 @@ class AlpacaBroker:
         self.profile_name = profile_name
 
     def _run(self, *args: str) -> dict | list:
+        env = os.environ.copy()
+        for key in _OVERRIDDEN_ALPACA_ENV_VARS:
+            env.pop(key, None)
         try:
             result = subprocess.run(
                 ["alpaca", *args, "--profile", self.profile_name],
                 capture_output=True,
                 text=True,
+                env=env,
             )
         except OSError as e:
             raise RuntimeError(f"Alpaca CLI not found or not executable: {e}") from e

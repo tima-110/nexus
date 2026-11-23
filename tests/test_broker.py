@@ -159,3 +159,30 @@ class TestGetLastPrice:
         with patch("subprocess.run", return_value=_make_run_result(data)):
             with pytest.raises(RuntimeError, match="no price field"):
                 broker.get_last_price("AAPL")
+
+
+def test_run_strips_apca_env_vars_so_profile_takes_precedence(monkeypatch):
+    monkeypatch.setenv("APCA_API_KEY_ID", "general-key")
+    monkeypatch.setenv("APCA_API_SECRET_KEY", "general-secret")
+    monkeypatch.setenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+    monkeypatch.setenv("ALPACA_API_KEY", "legacy-key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "legacy-secret")
+
+    captured_env = {}
+
+    def fake_run(cmd, **kwargs):
+        captured_env.update(kwargs.get("env") or {})
+        return _make_run_result(SAMPLE_ORDER_DICT)
+
+    broker = AlpacaBroker("champion")
+    with patch("subprocess.run", side_effect=fake_run):
+        broker.get_order("broker-order-123")
+
+    for forbidden in (
+        "APCA_API_KEY_ID",
+        "APCA_API_SECRET_KEY",
+        "APCA_API_BASE_URL",
+        "ALPACA_API_KEY",
+        "ALPACA_SECRET_KEY",
+    ):
+        assert forbidden not in captured_env
