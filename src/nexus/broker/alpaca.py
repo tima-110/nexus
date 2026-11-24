@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from decimal import Decimal
+from pathlib import Path
 
 from nexus.broker.types import BrokerAccount, BrokerOrder, BrokerPosition, BrokerOptionPosition
 from nexus.occ import parse_occ_symbol
@@ -26,9 +28,16 @@ class AlpacaBroker:
         env = os.environ.copy()
         for key in _OVERRIDDEN_ALPACA_ENV_VARS:
             env.pop(key, None)
+        # Cron and non-login shells omit user-local bin dirs from PATH.
+        path_parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+        for extra_dir in (str(Path.home() / ".local" / "bin"), "/usr/local/bin"):
+            if extra_dir not in path_parts:
+                path_parts.insert(0, extra_dir)
+        env["PATH"] = os.pathsep.join(path_parts)
+        alpaca_bin = shutil.which("alpaca", path=env["PATH"]) or "alpaca"
         try:
             result = subprocess.run(
-                ["alpaca", *args, "--profile", self.profile_name],
+                [alpaca_bin, *args, "--profile", self.profile_name],
                 capture_output=True,
                 text=True,
                 env=env,

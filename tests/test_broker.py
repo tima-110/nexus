@@ -186,3 +186,29 @@ def test_run_strips_apca_env_vars_so_profile_takes_precedence(monkeypatch):
         "ALPACA_SECRET_KEY",
     ):
         assert forbidden not in captured_env
+
+
+def test_run_includes_user_local_bin_in_path_for_cron(monkeypatch, tmp_path):
+    """Ensure cron environments with minimal PATH can still resolve ~/.local/bin/alpaca."""
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    local_bin = tmp_path / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    fake_alpaca = local_bin / "alpaca"
+    fake_alpaca.write_text("#!/bin/sh\n")
+    fake_alpaca.chmod(0o755)
+
+    captured_cmd = []
+    captured_env = {}
+
+    def fake_run(cmd, **kwargs):
+        captured_cmd.extend(cmd)
+        captured_env.update(kwargs.get("env") or {})
+        return _make_run_result(SAMPLE_ORDER_DICT)
+
+    broker = AlpacaBroker("champion")
+    with patch("subprocess.run", side_effect=fake_run):
+        broker.get_order("broker-order-123")
+
+    assert captured_cmd[0] == str(fake_alpaca)
+    assert str(local_bin) in captured_env["PATH"].split(":")
