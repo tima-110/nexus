@@ -149,3 +149,59 @@ def test_option_buy_guard_allows_close_short(conftest):
 
     ok, reason = check_option_buy_guard(conn, strategy_id, "NKE260718P00040000", 250.0)
     assert ok, f"Should pass (closing short): {reason}"
+
+
+def test_option_buy_guard_close_only_requires_short(conftest):
+    """With close_only=True, buying an option is blocked if no open short position exists."""
+    conn, strategy_id = conftest
+
+    ok, reason = check_option_buy_guard(
+        conn, strategy_id, "CMCSA261204P00024000", 15.0, close_only=True
+    )
+    assert not ok
+    assert "no short position" in reason
+
+    # Once a short position exists, close_only=True passes
+    conn.execute(
+        "INSERT INTO option_positions (strategy_id, symbol, underlying, option_right, side, qty,"
+        " avg_entry_price, strike, expiry, opened_at, updated_at)"
+        " VALUES (?, 'CMCSA261204P00024000', 'CMCSA', 'put', 'short', 1, 1.03, 24.0, '2026-12-04',"
+        " '2025-01-01T00:00:00', '2025-01-01T00:00:00')",
+        (strategy_id,),
+    )
+    conn.commit()
+    ok, reason = check_option_buy_guard(
+        conn, strategy_id, "CMCSA261204P00024000", 15.0, close_only=True
+    )
+    assert ok, f"Should pass when short exists: {reason}"
+
+
+def test_option_buy_and_sell_block_inflight_duplicate_orders(conftest):
+    """Active non-terminal orders block duplicate same-side option orders."""
+    conn, strategy_id = conftest
+
+    conn.execute(
+        "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status, client_order_id,"
+        " reserved_amount, filled_qty, actor, created_at, updated_at)"
+        " VALUES (?, 'CMCSA261204P00024000', 'buy', 1, 'limit', 'submitted', 'dup-opt-buy-1', 15.0, 0, 'test', ?, ?)",
+        (strategy_id, "2025-01-01T00:00:00", "2025-01-01T00:00:00"),
+    )
+    conn.execute(
+        "INSERT INTO orders (strategy_id, symbol, side, qty, order_type, status, client_order_id,"
+        " reserved_amount, filled_qty, actor, created_at, updated_at)"
+        " VALUES (?, 'NKE260718P00040000', 'sell', 1, 'limit', 'submitted', 'dup-opt-sell-1', 4000.0, 0, 'test', ?, ?)",
+        (strategy_id, "2025-01-01T00:00:00", "2025-01-01T00:00:00"),
+    )
+    conn.commit()
+
+    ok_buy, reason_buy = check_option_buy_guard(
+        conn, strategy_id, "CMCSA261204P00024000", 15.0
+    )
+    assert not ok_buy
+    assert "already open" in reason_buy
+
+    ok_sell, reason_sell = check_option_sell_guard(
+        conn, strategy_id, "NKE260718P00040000", 1
+    )
+    assert not ok_sell
+    assert "already open" in reason_sell

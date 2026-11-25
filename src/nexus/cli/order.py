@@ -158,6 +158,38 @@ def _record_order_legs(
     conn.commit()
 
 
+def _resolve_client_order_id(
+    conn,
+    strategy: str,
+    symbol: str,
+    custom_client_order_id: str | None,
+) -> str:
+    """Return a validated custom client_order_id or generate a unique Nexus ID."""
+    if custom_client_order_id is None:
+        return f"nx-{strategy[:6]}-{symbol}-{uuid4().hex[:8]}"
+
+    cid = custom_client_order_id.strip()
+    if not cid:
+        json_output({"error": "client_order_id cannot be empty"})
+        typer.echo("Error: client_order_id cannot be empty.", err=True)
+        raise typer.Exit(1)
+
+    existing = conn.execute(
+        "SELECT id, status FROM orders WHERE client_order_id = ?",
+        (cid,),
+    ).fetchone()
+    if existing is not None:
+        msg = (
+            f"Duplicate client_order_id '{cid}' already exists "
+            f"(order #{existing['id']}, status={existing['status']})"
+        )
+        json_output({"error": msg, "order_id": existing["id"], "client_order_id": cid})
+        typer.echo(f"Order blocked: {msg}", err=True)
+        raise typer.Exit(1)
+
+    return cid
+
+
 @order_app.command("buy")
 def order_buy(
     symbol: str = typer.Argument(..., help="Ticker symbol"),
@@ -172,6 +204,7 @@ def order_buy(
     take_profit: float | None = typer.Option(None, "--take-profit", help="Take-profit limit price"),
     stop_loss: float | None = typer.Option(None, "--stop-loss", help="Stop-loss trigger price"),
     short: bool = typer.Option(False, "--short/--no-short", help="Close an existing short position (buy-to-cover)"),
+    client_order_id: str | None = typer.Option(None, "--client-order-id", help="Optional deterministic idempotency key"),
     actor: str = typer.Option("cli:manual", "--actor"),
 ) -> None:
     """Place a buy order (open a long position, or buy-to-cover when --short is set)."""
@@ -223,7 +256,7 @@ def order_buy(
             raise typer.Exit(1)
         reserved_amt = estimated_cost
 
-    client_order_id = f"nx-{strategy[:6]}-{symbol}-{uuid4().hex[:8]}"
+    resolved_cid = _resolve_client_order_id(conn, strategy, symbol, client_order_id)
     now = _now()
 
     # Insert order record (status=pending)
@@ -237,7 +270,7 @@ def order_buy(
             strategy_id, symbol, qty, order_type,
             limit_price, stop_price, trail_percent, time_in_force,
             order_class, take_profit, stop_loss,
-            client_order_id, reserved_amt,
+            resolved_cid, reserved_amt,
             actor, now, now,
         ),
     )
@@ -253,7 +286,7 @@ def order_buy(
     try:
         result = broker.submit_order(
             symbol, qty, "buy", order_type,
-            client_order_id=client_order_id,
+            client_order_id=resolved_cid,
             limit_price=limit_price,
             stop_price=stop_price,
             trail_percent=trail_percent,
@@ -302,15 +335,15 @@ def order_buy(
         "take_profit": take_profit,
         "stop_loss": stop_loss,
         "time_in_force": time_in_force,
-        "client_order_id": client_order_id,
+        "client_order_id": resolved_cid,
         "broker_order_id": result.broker_order_id,
         "estimated_cost": estimated_cost,
         "actor": actor,
     })
 
-    if json_output({"status": "ok", "order_id": order_id, "client_order_id": client_order_id, "message": f"Order submitted: {client_order_id}"}):
+    if json_output({"status": "ok", "order_id": order_id, "client_order_id": resolved_cid, "message": f"Order submitted: {resolved_cid}"}):
         return
-    typer.echo(f"Order submitted: {client_order_id}")
+    typer.echo(f"Order submitted: {resolved_cid}")
 
 
 @order_app.command("sell")
@@ -327,6 +360,7 @@ def order_sell(
     take_profit: float | None = typer.Option(None, "--take-profit", help="Take-profit limit price"),
     stop_loss: float | None = typer.Option(None, "--stop-loss", help="Stop-loss trigger price"),
     short: bool = typer.Option(False, "--short/--no-short", help="Open a new short position (mirrors buy)"),
+    client_order_id: str | None = typer.Option(None, "--client-order-id", help="Optional deterministic idempotency key"),
     actor: str = typer.Option("cli:manual", "--actor"),
 ) -> None:
     """Place a sell order (close a long position, or open a short position when --short is set)."""
@@ -376,7 +410,7 @@ def order_sell(
             raise typer.Exit(1)
         reserved_amt = float(qty)
 
-    client_order_id = f"nx-{strategy[:6]}-{symbol}-{uuid4().hex[:8]}"
+    resolved_cid = _resolve_client_order_id(conn, strategy, symbol, client_order_id)
     now = _now()
 
     # Insert order record (status=pending)
@@ -390,7 +424,7 @@ def order_sell(
             strategy_id, symbol, qty, order_type,
             limit_price, stop_price, trail_percent, time_in_force,
             order_class, take_profit, stop_loss,
-            client_order_id, reserved_amt,
+            resolved_cid, reserved_amt,
             actor, now, now,
         ),
     )
@@ -406,7 +440,7 @@ def order_sell(
     try:
         result = broker.submit_order(
             symbol, qty, "sell", order_type,
-            client_order_id=client_order_id,
+            client_order_id=resolved_cid,
             limit_price=limit_price,
             stop_price=stop_price,
             trail_percent=trail_percent,
@@ -457,14 +491,14 @@ def order_sell(
         "take_profit": take_profit,
         "stop_loss": stop_loss,
         "time_in_force": time_in_force,
-        "client_order_id": client_order_id,
+        "client_order_id": resolved_cid,
         "broker_order_id": result.broker_order_id,
         "actor": actor,
     })
 
-    if json_output({"status": "ok", "order_id": order_id, "client_order_id": client_order_id, "message": f"Order submitted: {client_order_id}"}):
+    if json_output({"status": "ok", "order_id": order_id, "client_order_id": resolved_cid, "message": f"Order submitted: {resolved_cid}"}):
         return
-    typer.echo(f"Order submitted: {client_order_id}")
+    typer.echo(f"Order submitted: {resolved_cid}")
 
 
 @order_app.command("close")
@@ -807,6 +841,7 @@ def order_option_sell(
     limit_price: float = typer.Option(..., "--limit-price", help="Limit price per contract"),
     order_type: str = typer.Option("limit", "--type", help="Order type (default: limit)"),
     time_in_force: str | None = typer.Option("day", "--time-in-force", help="Time in force (day, gtc)"),
+    client_order_id: str | None = typer.Option(None, "--client-order-id", help="Optional deterministic idempotency key"),
     actor: str = typer.Option("cli:manual", "--actor"),
 ) -> None:
     """Sell an option (open a short position — cash-secured put or covered call).
@@ -847,7 +882,7 @@ def order_option_sell(
         typer.echo(f"Option sell blocked: {reason}", err=True)
         raise typer.Exit(1)
 
-    client_order_id = f"nx-{strategy[:6]}-{symbol}-{uuid4().hex[:8]}"
+    resolved_cid = _resolve_client_order_id(conn, strategy, symbol, client_order_id)
     now = _now()
 
     # Determine reservation amount:
@@ -863,7 +898,7 @@ def order_option_sell(
         " VALUES (?, ?, 'sell', ?, ?, ?, ?, 'option', 'pending', ?, ?, 0, ?, ?, ?)",
         (
             strategy_id, symbol, qty, order_type, limit_price,
-            time_in_force, client_order_id, assignment_obligation,
+            time_in_force, resolved_cid, assignment_obligation,
             actor, now, now,
         ),
     )
@@ -878,7 +913,7 @@ def order_option_sell(
     try:
         result = broker.submit_order(
             symbol, qty, "sell", order_type,
-            client_order_id=client_order_id,
+            client_order_id=resolved_cid,
             limit_price=limit_price,
             time_in_force=time_in_force,
         )
@@ -916,15 +951,15 @@ def order_option_sell(
         "order_type": order_type,
         "limit_price": limit_price,
         "time_in_force": time_in_force,
-        "client_order_id": client_order_id,
+        "client_order_id": resolved_cid,
         "broker_order_id": result.broker_order_id,
         "assignment_obligation": assignment_obligation,
         "actor": actor,
     })
 
-    if json_output({"status": "ok", "order_id": order_id, "client_order_id": client_order_id, "message": f"Option sell submitted: {client_order_id}"}):
+    if json_output({"status": "ok", "order_id": order_id, "client_order_id": resolved_cid, "message": f"Option sell submitted: {resolved_cid}"}):
         return
-    typer.echo(f"Option sell submitted: {client_order_id}")
+    typer.echo(f"Option sell submitted: {resolved_cid}")
 
 
 @order_app.command("option-buy")
@@ -935,6 +970,8 @@ def order_option_buy(
     limit_price: float = typer.Option(..., "--limit-price", help="Limit price per contract"),
     order_type: str = typer.Option("limit", "--type", help="Order type (default: limit)"),
     time_in_force: str | None = typer.Option("day", "--time-in-force", help="Time in force (day, gtc)"),
+    close: bool = typer.Option(False, "--close", help="Require an open short option position (buy-to-close only)"),
+    client_order_id: str | None = typer.Option(None, "--client-order-id", help="Optional deterministic idempotency key"),
     actor: str = typer.Option("cli:manual", "--actor"),
 ) -> None:
     """Buy an option (close a short position or open a long).
@@ -968,13 +1005,13 @@ def order_option_buy(
     estimated_cost = limit_price * 100 * qty
 
     # Guard check
-    ok, reason = check_buy_guard(conn, strategy_id, symbol, estimated_cost)
+    ok, reason = check_buy_guard(conn, strategy_id, symbol, estimated_cost, close_only=close)
     if not ok:
         json_output({"error": f"Option buy blocked: {reason}"})
         typer.echo(f"Option buy blocked: {reason}", err=True)
         raise typer.Exit(1)
 
-    client_order_id = f"nx-{strategy[:6]}-{symbol}-{uuid4().hex[:8]}"
+    resolved_cid = _resolve_client_order_id(conn, strategy, symbol, client_order_id)
     now = _now()
 
     # Insert order record
@@ -985,7 +1022,7 @@ def order_option_buy(
         " VALUES (?, ?, 'buy', ?, ?, ?, ?, 'option', 'pending', ?, ?, 0, ?, ?, ?)",
         (
             strategy_id, symbol, qty, order_type, limit_price,
-            time_in_force, client_order_id, estimated_cost,
+            time_in_force, resolved_cid, estimated_cost,
             actor, now, now,
         ),
     )
@@ -999,7 +1036,7 @@ def order_option_buy(
     try:
         result = broker.submit_order(
             symbol, qty, "buy", order_type,
-            client_order_id=client_order_id,
+            client_order_id=resolved_cid,
             limit_price=limit_price,
             time_in_force=time_in_force,
         )
@@ -1025,6 +1062,7 @@ def order_option_buy(
     log_event(audit_path, {
         "event": "order_submitted",
         "side": "option_buy",
+        "close": close,
         "right": right,
         "strategy": strategy,
         "symbol": symbol,
@@ -1035,15 +1073,15 @@ def order_option_buy(
         "order_type": order_type,
         "limit_price": limit_price,
         "time_in_force": time_in_force,
-        "client_order_id": client_order_id,
+        "client_order_id": resolved_cid,
         "broker_order_id": result.broker_order_id,
         "estimated_cost": estimated_cost,
         "actor": actor,
     })
 
-    if json_output({"status": "ok", "order_id": order_id, "client_order_id": client_order_id, "message": f"Option buy submitted: {client_order_id}"}):
+    if json_output({"status": "ok", "order_id": order_id, "client_order_id": resolved_cid, "message": f"Option buy submitted: {resolved_cid}"}):
         return
-    typer.echo(f"Option buy submitted: {client_order_id}")
+    typer.echo(f"Option buy submitted: {resolved_cid}")
 
 
 @order_app.command("replace")

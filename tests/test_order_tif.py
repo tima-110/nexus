@@ -177,3 +177,108 @@ class TestOrderListTif:
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["items"][0]["time_in_force"] == "gtc"
+
+
+class TestOptionCloseAndIdempotency:
+    @patch("nexus.cli.order.sync_outstanding_orders")
+    @patch("nexus.cli.order.get_connection")
+    @patch("subprocess.run")
+    def test_option_buy_close_blocks_when_no_short_position(
+        self, mock_subprocess, mock_conn, mock_sync
+    ):
+        """option-buy --close must reject if no open short option exists (never open long)."""
+        conn = _setup_conn_with_position()
+        mock_conn.return_value = conn
+        mock_sync.return_value = None
+
+        result = runner.invoke(
+            app,
+            [
+                "--json",
+                "order",
+                "option-buy",
+                "CMCSA261204P00024000",
+                "1",
+                "--strategy",
+                "test_strat",
+                "--limit-price",
+                "0.15",
+                "--close",
+            ],
+        )
+        assert result.exit_code == 1
+        data = json.loads(result.output.splitlines()[0])
+        assert "no short position" in data["error"]
+        mock_subprocess.assert_not_called()
+
+    @patch("nexus.cli.order.sync_outstanding_orders")
+    @patch("nexus.cli.order.get_connection")
+    @patch("subprocess.run")
+    def test_custom_client_order_id_rejects_duplicate(
+        self, mock_subprocess, mock_conn, mock_sync
+    ):
+        """Passing the same --client-order-id twice must reject the second submission."""
+        conn = _setup_conn_with_position()
+        mock_conn.return_value = conn
+        mock_sync.return_value = None
+        mock_subprocess.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps(
+                _broker_order_response(
+                    side="sell", client_order_id="custom-idemp-key-1"
+                )
+            ),
+            stderr="",
+        )
+
+        first = runner.invoke(
+            app,
+            [
+                "--json",
+                "order",
+                "sell",
+                "AAPL",
+                "5",
+                "--strategy",
+                "test_strat",
+                "--type",
+                "limit",
+                "--limit-price",
+                "160.0",
+                "--client-order-id",
+                "custom-idemp-key-1",
+            ],
+        )
+        assert first.exit_code == 0
+        first_data = json.loads(first.output)
+        assert first_data["client_order_id"] == "custom-idemp-key-1"
+
+        # Mark first order filled so the duplicate-idempotency check (not in-flight check) triggers
+        conn.execute(
+            "UPDATE orders SET status = 'filled' WHERE id = ?",
+            (first_data["order_id"],),
+        )
+        conn.commit()
+
+        second = runner.invoke(
+            app,
+            [
+                "--json",
+                "order",
+                "sell",
+                "AAPL",
+                "5",
+                "--strategy",
+                "test_strat",
+                "--type",
+                "limit",
+                "--limit-price",
+                "160.0",
+                "--client-order-id",
+                "custom-idemp-key-1",
+            ],
+        )
+        assert second.exit_code == 1
+        second_data = json.loads(second.output.splitlines()[0])
+        assert "Duplicate client_order_id" in second_data["error"]
+        assert mock_subprocess.call_count == 1

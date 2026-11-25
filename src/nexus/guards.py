@@ -6,6 +6,36 @@ import sqlite3
 
 from nexus.occ import is_occ_symbol, parse_occ_symbol
 
+ACTIVE_ORDER_STATUSES = (
+    "pending",
+    "submitted",
+    "new",
+    "accepted",
+    "held",
+    "partially_filled",
+)
+
+
+def _check_inflight_duplicate_order(
+    conn: sqlite3.Connection,
+    strategy_id: int,
+    symbol: str,
+    side: str,
+) -> tuple[bool, str]:
+    """Reject duplicate submission when an active non-terminal order exists."""
+    placeholders = ", ".join("?" for _ in ACTIVE_ORDER_STATUSES)
+    existing = conn.execute(
+        f"SELECT id, status FROM orders"
+        f" WHERE strategy_id = ? AND symbol = ? AND side = ? AND status IN ({placeholders})"
+        f" ORDER BY id DESC LIMIT 1",
+        (strategy_id, symbol, side, *ACTIVE_ORDER_STATUSES),
+    ).fetchone()
+    if existing is not None:
+        return False, (
+            f"active {side} order #{existing['id']} ({existing['status']}) already open for {symbol}"
+        )
+    return True, ""
+
 
 def _get_available_cash(conn: sqlite3.Connection, strategy_id: int) -> tuple[float | None, str]:
     """Compute available cash for opening new positions (long or short).
@@ -44,21 +74,30 @@ def check_buy_guard(
     *,
     short: bool = False,
     qty: int = 0,
+    close_only: bool = False,
 ) -> tuple[bool, str]:
     """Check if a buy order is allowed.
 
     When short=False (default — Open Long):
-    1. Strategy does NOT already hold the symbol (no duplicate positions)
-    2. Available buying power >= estimated_cost
+    1. No active buy order already open for this symbol
+    2. Strategy does NOT already hold the symbol (no duplicate positions)
+    3. Available buying power >= estimated_cost
 
     When short=True (Close Short / Buy-to-Cover):
-    1. Strategy MUST hold a short position in the symbol (qty < 0)
-    2. Available short shares (abs(qty) - reserved_qty) >= requested qty
+    1. No active buy order already open for this symbol
+    2. Strategy MUST hold a short position in the symbol (qty < 0)
+    3. Available short shares (abs(qty) - reserved_qty) >= requested qty
 
     Returns (True, "") if OK, (False, "reason") if blocked.
     """
     if is_occ_symbol(symbol):
-        return check_option_buy_guard(conn, strategy_id, symbol, estimated_cost)
+        return check_option_buy_guard(
+            conn, strategy_id, symbol, estimated_cost, close_only=close_only or short
+        )
+
+    ok, err = _check_inflight_duplicate_order(conn, strategy_id, symbol, "buy")
+    if not ok:
+        return False, err
 
     if short:
         position = conn.execute(
@@ -118,6 +157,10 @@ def check_sell_guard(
     if is_occ_symbol(symbol):
         return check_option_sell_guard(conn, strategy_id, symbol, qty)
 
+    ok, err = _check_inflight_duplicate_order(conn, strategy_id, symbol, "sell")
+    if not ok:
+        return False, err
+
     if short:
         row = conn.execute(
             "SELECT id FROM positions WHERE strategy_id = ? AND symbol = ? AND qty != 0",
@@ -166,6 +209,10 @@ def check_option_sell_guard(
 
     Returns (True, "") if OK, (False, "reason") if blocked.
     """
+    ok, err = _check_inflight_duplicate_order(conn, strategy_id, symbol, "sell")
+    if not ok:
+        return False, err
+
     parsed = parse_occ_symbol(symbol)
     strike = parsed["strike"]
     right = parsed["right"]
@@ -223,14 +270,21 @@ def check_option_buy_guard(
     strategy_id: int,
     symbol: str,
     estimated_cost: float,
+    *,
+    close_only: bool = False,
 ) -> tuple[bool, str]:
     """Check if an option buy order is allowed (close a short or open a long).
 
     For closing a short: strategy must have an open short position in this symbol.
-    For opening a long: no existing long position (duplicates blocked), sufficient cash.
+    For opening a long: blocked if close_only=True, or if long already exists.
+    Always blocks if an active buy order is already in flight for this symbol.
 
     Returns (True, "") if OK, (False, "reason") if blocked.
     """
+    ok, err = _check_inflight_duplicate_order(conn, strategy_id, symbol, "buy")
+    if not ok:
+        return False, err
+
     # Check if strategy has a short position in this symbol → closing
     short_pos = conn.execute(
         "SELECT id, qty FROM option_positions"
@@ -239,6 +293,8 @@ def check_option_buy_guard(
     ).fetchone()
 
     if short_pos is None:
+        if close_only:
+            return False, f"no short position in {symbol}"
         # Not closing a short — this is a buy-to-open. Block if long already exists.
         long_pos = conn.execute(
             "SELECT id FROM option_positions"

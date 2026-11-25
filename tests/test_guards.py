@@ -161,3 +161,24 @@ class TestShortGuards:
         )
         assert ok is False
         assert "insufficient" in reason.lower()
+
+
+class TestInflightDuplicateOrderGuards:
+    def test_buy_blocked_when_active_buy_order_open(self, conn, sample_strategy):
+        _insert_order(conn, sample_strategy, symbol="AAPL", side="buy", status="submitted")
+        ok, reason = check_buy_guard(conn, sample_strategy, "AAPL", 100.0)
+        assert ok is False
+        assert "already open" in reason.lower()
+
+    def test_sell_blocked_when_active_sell_order_open(self, conn, sample_strategy):
+        _insert_position(conn, sample_strategy, "AAPL", qty=100, reserved_qty=0)
+        _insert_order(conn, sample_strategy, symbol="AAPL", side="sell", status="submitted")
+        ok, reason = check_sell_guard(conn, sample_strategy, "AAPL", 10)
+        assert ok is False
+        assert "already open" in reason.lower()
+
+    def test_terminal_order_does_not_block_new_order(self, conn, sample_strategy):
+        _insert_order(conn, sample_strategy, symbol="AAPL", side="buy", status="cancelled")
+        ok, reason = check_buy_guard(conn, sample_strategy, "AAPL", 100.0)
+        assert ok is True
+        assert reason == ""
